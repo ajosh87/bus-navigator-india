@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { MONUMENTS, Monument, Party, quote } from './monuments';
+import type { OfficialTicket } from './ticketing/officialTicket';
 
 /**
  * Booking is behind a provider interface so the concierge UI never knows who
@@ -43,8 +44,14 @@ export interface Ticket {
    * settlement needs a gateway webhook; without one this app cannot know.
    */
   paymentVerified: boolean;
-  /** What the gate QR encodes. */
+  /** What the gate QR encodes when no official ticket has been captured. */
   qrPayload: string;
+  /**
+   * The ticket the authority actually issued, once captured from its QR.
+   * When present this is what the gate is shown — our own record is only a
+   * placeholder until then.
+   */
+  officialTicket?: OfficialTicket;
   createdAt: number;
 }
 

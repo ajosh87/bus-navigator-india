@@ -16,15 +16,20 @@ import { MONUMENTS, Monument, Party, findMonuments, isClosedOn, quote } from '..
 import {
   Ticket, localProvider, upiIntent, loadTickets, saveTicket, updateTicket, removeTicket,
 } from '../booking';
+import { CameraView, useCameraPermissions } from 'expo-camera';
+
 import { useApiKey } from '../ApiKeyContext';
 import { useSettings } from '../settingsStore';
+import {
+  parseOfficialTicket, describeCapture, describeAmount,
+} from '../ticketing/officialTicket';
 import { translate, speechToText, synthesize, playAudio } from '../api';
 import { useRecorder } from '../useRecorder';
 import { unlockAudio } from '../audio';
 
-type Step = 'site' | 'when' | 'party' | 'review' | 'pay' | 'done';
+type Step = 'site' | 'when' | 'party' | 'review' | 'pay' | 'capture' | 'done';
 
-const STEP_ORDER: Step[] = ['site', 'when', 'party', 'review', 'pay', 'done'];
+const STEP_ORDER: Step[] = ['site', 'when', 'party', 'review', 'pay', 'capture', 'done'];
 
 const NUMBER_WORDS: Record<string, number> = {
   zero: 0, none: 0, one: 1, a: 1, two: 2, three: 3, four: 4, five: 5,
@@ -84,6 +89,15 @@ export default function TicketsScreen() {
   const [status, setStatus]   = useState<string | null>(null);
   const [speaking, setSpeak]  = useState(false);
 
+  /**
+   * Payment is the one step that must not be quiet. The amount is spoken and
+   * has to be acknowledged before the payment code is shown at all, so a
+   * non-reading user cannot approve a sum they never heard.
+   */
+  const [amountAcknowledged, setAcknowledged] = useState(false);
+  const [scanningTicket, setScanningTicket]   = useState(false);
+  const [camPermission, requestCamPermission] = useCameraPermissions();
+
   const spokenFor = useRef<Step | null>(null);
 
   useEffect(() => { void loadTickets().then(setTickets); }, []);
@@ -107,6 +121,8 @@ export default function TicketsScreen() {
     setMode('booking');
     spokenFor.current = null;
     setDraft(null);
+    setAcknowledged(false);
+    setScanningTicket(false);
     setSearch('');
     setParty({ adults: 1, children: 0, foreign: false, includeSurcharge: false });
     setDate(isoDate(new Date()));
@@ -175,11 +191,16 @@ export default function TicketsScreen() {
       }
       case 'pay': {
         const amount = draft?.amount ?? 0;
+        if (!amountAcknowledged) {
+          return describeAmount(amount, draft?.monumentName ?? 'this visit');
+        }
         return `Please pay ${amount} rupees. Open your bank app, scan the code on screen, and enter your own UPI PIN. This app never sees your PIN.`;
       }
+      case 'capture':
+        return 'Now point the camera at the QR code on the ticket you were issued, so I can keep it for the gate.';
       case 'done': return 'Your booking is saved. Show the code at the gate.';
     }
-  }, [site, party, date, draft]);
+  }, [site, party, date, draft, amountAcknowledged]);
 
   // Read each new step aloud once, so a non-reading user is never stranded.
   useEffect(() => {
@@ -198,6 +219,8 @@ export default function TicketsScreen() {
     spokenFor.current = null;
     setSite(null);
     setDraft(null);
+    setAcknowledged(false);
+    setScanningTicket(false);
     setSearch('');
     setParty({ adults: 1, children: 0, foreign: false, includeSurcharge: false });
     setDate(isoDate(new Date()));
@@ -262,8 +285,40 @@ export default function TicketsScreen() {
     setTickets(next);
     setDraft(next.find((t) => t.id === draft.id) ?? draft);
     spokenFor.current = null;
-    setStep('done');
+    // Paying is not the end: the ticket the authority issued still has to be
+    // captured, or there is nothing valid to show at the gate.
+    setStep('capture');
   };
+
+  /**
+   * Stores the QR from the issued ticket. The payload is kept verbatim — it is
+   * reproduced at the gate, and any reformatting risks a code the scanner
+   * rejects.
+   */
+  const onTicketScanned = useCallback(async ({ data }: { data: string }) => {
+    if (!draft || !scanningTicket) return;
+
+    const captured = parseOfficialTicket(data);
+    if (!captured) {
+      toast('That code is too short to be a ticket', 'error');
+      return;
+    }
+
+    setScanningTicket(false);
+    await updateTicket(draft.id, {
+      officialTicket: captured,
+      official: true,
+      issuer: captured.issuerHost ?? 'Ticketing authority',
+    });
+
+    const next = await loadTickets();
+    setTickets(next);
+    setDraft(next.find((t) => t.id === draft.id) ?? draft);
+    spokenFor.current = null;
+    setStep('done');
+
+    void say(describeCapture(captured));
+  }, [draft, scanningTicket, say, toast]);
 
   const discard = async (id: string) => {
     setTickets(await removeTicket(id));
@@ -315,27 +370,43 @@ export default function TicketsScreen() {
                       {' · '}₹{t.amount}
                     </Text>
                   </View>
-                  <View style={[s.statusPill, t.status === 'paid' && s.statusPillPaid]}>
+                  <View style={[s.statusPill, t.officialTicket && s.statusPillPaid]}>
                     <Text
                       style={[
                         type.overline,
-                        { color: t.status === 'paid' ? colors.success : colors.warning },
+                        { color: t.officialTicket ? colors.success : colors.warning },
                       ]}
                     >
-                      {t.status === 'paid' ? 'PAID' : 'UNPAID'}
+                      {/* Whether the gate can scan it matters more than whether
+                          we were told it was paid. */}
+                      {t.officialTicket ? 'TICKETED' : t.status === 'paid' ? 'NO TICKET YET' : 'UNPAID'}
                     </Text>
                   </View>
                 </View>
 
                 {openQr === t.id && (
                   <View style={s.qrPane}>
-                    <QrCode value={t.qrPayload} size={180} label={`Ref ${t.id}`} />
-                    {settings.showQrCaveats && !t.official && (
+                    <QrCode
+                      value={t.officialTicket?.payload ?? t.qrPayload}
+                      size={180}
+                      label={
+                        t.officialTicket
+                          ? t.officialTicket.reference
+                            ? `Ref ${t.officialTicket.reference}`
+                            : 'Issued ticket'
+                          : `Ref ${t.id}`
+                      }
+                    />
+                    {t.officialTicket ? (
+                      <Text style={[type.meta, s.qrCaveat, { color: colors.success }]}>
+                        Issued ticket{t.officialTicket.issuerHost ? ` from ${t.officialTicket.issuerHost}` : ''} — show this at the gate.
+                      </Text>
+                    ) : settings.showQrCaveats ? (
                       <Text style={[type.meta, s.qrCaveat]}>
                         Issued by {t.issuer}. Not an ASI ticket — carry official ID and expect
                         to buy at the counter.
                       </Text>
-                    )}
+                    ) : null}
                   </View>
                 )}
 
@@ -620,7 +691,30 @@ export default function TicketsScreen() {
 
             <View style={s.rule} />
 
-            {upiLink ? (
+            {!amountAcknowledged ? (
+              // The payment code is withheld until the amount has been heard
+              // and acknowledged. This is the one gate that must not be quiet.
+              <View style={{ width: '100%', gap: space.md, marginTop: space.lg }}>
+                <Button
+                  label={speaking ? 'Reading it out…' : 'Read the amount to me'}
+                  variant="secondary"
+                  icon="volume-2"
+                  onPress={() => say(describeAmount(draft.amount, draft.monumentName))}
+                  loading={speaking}
+                  disabled={!aiEnabled}
+                />
+                <Button
+                  label={`Confirm ₹${draft.amount}`}
+                  icon="check"
+                  onPress={() => setAcknowledged(true)}
+                />
+                <Button
+                  label="Go back"
+                  variant="ghost"
+                  onPress={() => { spokenFor.current = null; setStep('review'); }}
+                />
+              </View>
+            ) : upiLink ? (
               <>
                 <QrCode value={upiLink} size={190} label="Scan with any UPI app" />
                 <Text style={[type.meta, s.payHelp]}>
@@ -672,30 +766,115 @@ export default function TicketsScreen() {
         </>
       )}
 
+      {step === 'capture' && !!draft && (
+        <>
+          <Card>
+            <Text style={[type.label, { color: colors.text }]}>
+              Capture the ticket you were issued
+            </Text>
+            <Text style={[type.meta, { color: colors.textSecondary, marginTop: 4 }]}>
+              The gate scans the QR printed on your ticket — on the PDF, the email, or a
+              printout. Point the camera at it and I will keep it for you.
+            </Text>
+
+            {scanningTicket ? (
+              <View style={s.captureStage}>
+                <CameraView
+                  style={s.captureFill}
+                  facing="back"
+                  barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+                  onBarcodeScanned={onTicketScanned}
+                />
+                <View style={s.captureHint}>
+                  <Text style={[type.meta, { color: colors.white }]}>
+                    Point at the ticket’s QR code
+                  </Text>
+                </View>
+              </View>
+            ) : null}
+
+            <View style={{ gap: space.md, marginTop: space.lg }}>
+              <Button
+                label={scanningTicket ? 'Stop scanning' : 'Scan the ticket QR'}
+                icon={scanningTicket ? 'x' : 'camera'}
+                variant={scanningTicket ? 'secondary' : 'primary'}
+                onPress={async () => {
+                  if (scanningTicket) { setScanningTicket(false); return; }
+                  if (!camPermission?.granted) {
+                    const res = await requestCamPermission();
+                    if (!res.granted) { toast('Camera blocked', 'error'); return; }
+                  }
+                  setScanningTicket(true);
+                }}
+              />
+              <Button
+                label="I don’t have it yet"
+                variant="ghost"
+                onPress={() => { spokenFor.current = null; setStep('done'); }}
+              />
+            </View>
+          </Card>
+
+          <Banner
+            tone="info"
+            text="Until the issued ticket is captured, this booking is only a reminder — the gate cannot scan it."
+          />
+        </>
+      )}
+
       {step === 'done' && !!draft && (
         <>
           <Card style={{ alignItems: 'center' }}>
-            <View style={s.doneMark}>
-              <Feather name="check" size={22} color={colors.textInverse} />
+            <View style={[s.doneMark, !draft.officialTicket && s.doneMarkPending]}>
+              <Feather
+                name={draft.officialTicket ? 'check' : 'clock'}
+                size={22}
+                color={colors.textInverse}
+              />
             </View>
             <Text style={[type.h2, { color: colors.text, marginTop: space.lg }]}>
-              Booking saved
+              {draft.officialTicket ? 'Ticket saved' : 'Booking saved'}
             </Text>
             <Text style={[type.meta, { color: colors.textSecondary, marginTop: 4, textAlign: 'center' }]}>
               {draft.monumentName} · {prettyDate(draft.date)} · ₹{draft.amount}
             </Text>
 
             <View style={{ marginTop: space.xl }}>
-              <QrCode value={draft.qrPayload} size={190} label={`Ref ${draft.id}`} />
+              {/* The issued ticket's own code when we have it; ours only until then. */}
+              <QrCode
+                value={draft.officialTicket?.payload ?? draft.qrPayload}
+                size={190}
+                label={
+                  draft.officialTicket
+                    ? draft.officialTicket.reference
+                      ? `Ref ${draft.officialTicket.reference}`
+                      : draft.officialTicket.issuerHost ?? 'Issued ticket'
+                    : `Ref ${draft.id}`
+                }
+              />
             </View>
           </Card>
 
-          <Banner
-            tone="warning"
-            text="This is not a government-issued ticket. Carry photo ID and be ready to buy at the counter."
-          />
+          {draft.officialTicket ? (
+            <Banner
+              tone="success"
+              text={`Issued ticket stored${draft.officialTicket.issuerHost ? ` from ${draft.officialTicket.issuerHost}` : ''}. Show this code at the gate.`}
+            />
+          ) : (
+            <Banner
+              tone="warning"
+              text="This is not a government-issued ticket. Carry photo ID and be ready to buy at the counter."
+            />
+          )}
 
           <View style={{ paddingHorizontal: space.xl, gap: space.md }}>
+            {!draft.officialTicket && (
+              <Button
+                label="Capture the issued ticket"
+                icon="camera"
+                onPress={() => { spokenFor.current = null; setStep('capture'); }}
+              />
+            )}
             <Button label="Read this to me" variant="secondary" icon="volume-2" onPress={() => say(prompt('done'))} />
             <Button label="Back to my tickets" onPress={() => setMode('wallet')} />
           </View>
@@ -837,5 +1016,20 @@ const s = StyleSheet.create({
     backgroundColor: colors.success,
     alignItems: 'center', justifyContent: 'center',
     ...shadow(1),
+  },
+  doneMarkPending: { backgroundColor: colors.warning },
+
+  captureStage: {
+    height: 240, marginTop: space.lg,
+    borderRadius: radius.lg, overflow: 'hidden',
+    backgroundColor: colors.ink,
+    borderWidth: hairline, borderColor: colors.line,
+  },
+  captureFill: { flex: 1 },
+  captureHint: {
+    position: 'absolute', bottom: space.md, alignSelf: 'center',
+    paddingHorizontal: space.lg, paddingVertical: 6,
+    backgroundColor: 'rgba(8,10,14,0.78)',
+    borderRadius: radius.full,
   },
 });
