@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View, Text, StyleSheet, Pressable, ScrollView, ActivityIndicator, Platform, Linking,
 } from 'react-native';
@@ -12,7 +12,10 @@ import {
 } from '../ui';
 import { QrCode } from '../QrCode';
 import { LANGUAGES } from '../languages';
-import { MONUMENTS, Monument, Party, findMonuments, isClosedOn, quote } from '../monuments';
+import {
+  MONUMENTS, Monument, Party, isClosedOn, isFreeEntry, monumentById, quote,
+} from '../monuments';
+import { findMonuments } from '../monumentSearch';
 import {
   Ticket, localProvider, upiIntent, loadTickets, saveTicket, updateTicket, removeTicket,
 } from '../booking';
@@ -23,6 +26,9 @@ import { useSettings } from '../settingsStore';
 import {
   parseOfficialTicket, describeCapture, describeAmount,
 } from '../ticketing/officialTicket';
+import {
+  interpret, describeOptions, parseAmendTarget, parseOrdinalChoice,
+} from '../ticketing/conversation';
 import { translate, speechToText, synthesize, playAudio } from '../api';
 import { useRecorder } from '../useRecorder';
 import { unlockAudio } from '../audio';
@@ -32,25 +38,11 @@ type Step = 'site' | 'when' | 'party' | 'review' | 'pay' | 'capture' | 'done';
 
 const STEP_ORDER: Step[] = ['site', 'when', 'party', 'review', 'pay', 'capture', 'done'];
 
-const NUMBER_WORDS: Record<string, number> = {
-  zero: 0, none: 0, one: 1, a: 1, two: 2, three: 3, four: 4, five: 5,
-  six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12,
-  thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17,
-  eighteen: 18, nineteen: 19, twenty: 20,
-};
+const MONUMENT_COUNT = MONUMENTS.length;
 
-/** Pull a count out of free text: digits first, then English number words. */
-function parseCount(text: string): number | null {
-  const digits = text.match(/\d+/);
-  if (digits) {
-    const n = parseInt(digits[0], 10);
-    if (n >= 0 && n <= 50) return n;
-  }
-  for (const word of text.toLowerCase().split(/[^a-z]+/)) {
-    if (word in NUMBER_WORDS) return NUMBER_WORDS[word];
-  }
-  return null;
-}
+const WEEKDAY_NAMES = [
+  'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday',
+];
 
 function isoDate(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -65,7 +57,7 @@ export default function TicketsScreen() {
   const { apiKey, aiEnabled, langPrefs, upi } = useApiKey();
   const settings = useSettings();
   const toast = useToast();
-  const { listen, recordState } = useRecorder();
+  const { listen, cancel, recordState } = useRecorder();
 
   const key = apiKey || undefined;
   const lang = langPrefs.mine;
@@ -101,6 +93,15 @@ export default function TicketsScreen() {
 
   const spokenFor = useRef<Step | null>(null);
 
+  /**
+   * `talking` is a ref, not state: the loop tests it between every await and
+   * must see the Stop control's write immediately, which a re-render would
+   * not guarantee. `conversing` exists only so the button can redraw.
+   */
+  const talking = useRef(false);
+  const [conversing, setConversing] = useState(false);
+  const pendingConverse = useRef<Step | null>(null);
+
   useEffect(() => { void loadTickets().then(setTickets); }, []);
 
   // "book a ticket to the Taj Mahal" arrives here as navigation params.
@@ -115,9 +116,7 @@ export default function TicketsScreen() {
     if (handledParams.current === token) return;
     handledParams.current = token;
 
-    const preset = params.monumentId
-      ? MONUMENTS.find((m) => m.id === params.monumentId)
-      : undefined;
+    const preset = params.monumentId ? monumentById(params.monumentId) : undefined;
 
     setMode('booking');
     spokenFor.current = null;
@@ -131,9 +130,11 @@ export default function TicketsScreen() {
     if (preset) {
       setSite(preset);
       setStep('when');       // monument already chosen, skip ahead
+      pendingConverse.current = 'when';
     } else {
       setSite(null);
       setStep('site');
+      pendingConverse.current = 'site';
     }
   }, [params]);
 
@@ -179,29 +180,71 @@ export default function TicketsScreen() {
 
   // ── step narration ─────────────────────────────────────────────────────────
 
-  const prompt = useCallback((s: Step): string => {
+  /**
+   * The question for a step, built from values passed in rather than read from
+   * state. The conversation loop runs ahead of React's re-renders, so it needs
+   * to ask about the answer it just received, not the one on screen.
+   */
+  const promptFor = useCallback((s: Step, ctx: {
+    site: Monument | null;
+    date: string;
+    party: Party;
+    draft: Ticket | null;
+    acknowledged: boolean;
+  }): string => {
     switch (s) {
       case 'site':  return 'Which monument would you like to visit?';
-      case 'when':  return `When would you like to visit ${site?.name ?? 'the monument'}?`;
-      case 'party': return 'How many adults are travelling?';
+      case 'when': {
+        const name = ctx.site?.name ?? 'the monument';
+        // Saying the closed day up front saves a rejected answer and a retry.
+        const shut = ctx.site?.closedDay !== undefined
+          ? ` It is closed on ${WEEKDAY_NAMES[ctx.site.closedDay]}s.`
+          : '';
+        return `When would you like to visit ${name}?${shut}`;
+      }
+      case 'party':
+        return 'How many people are coming? You can say, for example, two adults and one child.';
       case 'review': {
-        if (!site) return '';
-        const { total } = quote(site, party);
-        const kids = party.children === 1 ? '1 child' : `${party.children} children`;
-        return `${site.name} in ${site.city}, on ${prettyDate(date)}, for ${party.adults} adult${party.adults === 1 ? '' : 's'}${party.children ? ` and ${kids}` : ''}. The total is ${total} rupees. Is that correct?`;
+        if (!ctx.site) return '';
+        const { total } = quote(ctx.site, ctx.party);
+        const kids = ctx.party.children === 1 ? '1 child' : `${ctx.party.children} children`;
+        // The nationality is spoken here on purpose: it is the difference
+        // between 50 rupees and 1100 at the Taj, and it is never asked about
+        // directly, so review is the only place it can be caught.
+        const rate = ctx.party.foreign ? ' at the foreign national rate' : ' at the Indian national rate';
+        return `${ctx.site.name} in ${ctx.site.city}, on ${prettyDate(ctx.date)}, for ${ctx.party.adults} adult${ctx.party.adults === 1 ? '' : 's'}${ctx.party.children ? ` and ${kids}` : ''}${rate}. The total is ${total} rupees. Shall I reserve it?`;
       }
       case 'pay': {
-        const amount = draft?.amount ?? 0;
-        if (!amountAcknowledged) {
-          return describeAmount(amount, draft?.monumentName ?? 'this visit');
+        const amount = ctx.draft?.amount ?? 0;
+        if (!ctx.acknowledged) {
+          return `${describeAmount(amount, ctx.draft?.monumentName ?? 'this visit')} Shall I show the payment code?`;
         }
-        return `Please pay ${amount} rupees. Open your bank app, scan the code on screen, and enter your own UPI PIN. This app never sees your PIN.`;
+        return `Please pay ${amount} rupees. Open your bank app, scan the code on screen, and enter your own UPI PIN. This app never sees your PIN. Say “I have paid” when it is done.`;
       }
       case 'capture':
-        return 'Now point the camera at the QR code on the ticket you were issued, so I can keep it for the gate.';
+        return 'Now point the camera at the QR code on the ticket you were issued, so I can keep it for the gate. Say “ready” when you have it in front of you.';
       case 'done': return 'Your booking is saved. Show the code at the gate.';
     }
-  }, [site, party, date, draft, amountAcknowledged]);
+  }, []);
+
+  /** The prompt for what is currently on screen. */
+  const prompt = useCallback(
+    (s: Step) => promptFor(s, { site, date, party, draft, acknowledged: amountAcknowledged }),
+    [promptFor, site, date, party, draft, amountAcknowledged],
+  );
+
+  /** What to offer when someone says "I don't know". */
+  const helpFor = (s: Step): string => {
+    switch (s) {
+      case 'site':  return 'Say the name of a monument, like Taj Mahal, or a city, like Jaipur.';
+      case 'when':  return 'Say a day, like today, tomorrow, next Sunday, or the twelfth of March.';
+      case 'party': return 'Say how many are coming, like two adults, or just me.';
+      case 'review': return 'Say yes to reserve it, or no to change something.';
+      case 'pay':   return 'Say yes to see the payment code, or cancel to stop.';
+      case 'capture': return 'Say ready to open the camera, or skip if you do not have the ticket yet.';
+      default: return 'Say cancel to stop.';
+    }
+  };
 
   // Read each new step aloud once, so a non-reading user is never stranded.
   useEffect(() => {
@@ -214,9 +257,10 @@ export default function TicketsScreen() {
 
   // ── actions ────────────────────────────────────────────────────────────────
 
-  const startBooking = () => {
+  const startBooking = (handsFree = true) => {
     setMode('booking');
     setStep('site');
+    if (handsFree) pendingConverse.current = 'site';
     spokenFor.current = null;
     setSite(null);
     setDraft(null);
@@ -227,69 +271,299 @@ export default function TicketsScreen() {
     setDate(isoDate(new Date()));
   };
 
-  const pickSiteByVoice = async () => {
-    const heard = await askByVoice();
-    if (!heard) return;
-    const matches = findMonuments(heard);
-    if (matches.length === 0) {
-      await say(`I could not find a monument called ${heard}. Please try again.`);
-      return;
-    }
-    setSite(matches[0]);
-    setSearch('');
-    spokenFor.current = null;
-    setStep('when');
-  };
-
-  const pickPartyByVoice = async () => {
-    const heard = await askByVoice();
-    if (!heard) return;
-    const n = parseCount(heard);
-    if (n === null || n < 1) {
-      await say('Please say how many adults, for example: two.');
-      return;
-    }
-    setParty((p) => ({ ...p, adults: Math.min(n, 20) }));
-    spokenFor.current = null;
-    setStep('review');
-  };
-
-  const reserve = async () => {
-    if (!site) return;
+  /** Reserves from explicit values, so the conversation need not wait on state. */
+  const reserveWith = useCallback(async (
+    m: Monument, when: string, who: Party, name: string,
+  ): Promise<Ticket | null> => {
     setStatus('Reserving…');
     try {
       const ticket = await localProvider.reserve({
-        monument: site,
-        date,
-        party,
-        visitorName: visitor.trim() || 'Guest',
+        monument: m,
+        date: when,
+        party: who,
+        visitorName: name.trim() || 'Guest',
       });
       setDraft(ticket);
       await saveTicket(ticket);
       setTickets(await loadTickets());
-      spokenFor.current = null;
-      setStep(ticket.amount === 0 ? 'done' : 'pay');
+      return ticket;
     } catch (e: any) {
       toast(e?.message ?? 'Could not reserve', 'error');
+      return null;
     } finally {
       setStatus(null);
     }
+  }, [toast]);
+
+  const reserve = async () => {
+    if (!site) return;
+    const ticket = await reserveWith(site, date, party, visitor);
+    if (!ticket) return;
+    spokenFor.current = null;
+    setStep(ticket.amount === 0 ? 'done' : 'pay');
   };
+
+  const attestPaidFor = useCallback(async (ticket: Ticket) => {
+    await updateTicket(ticket.id, { status: 'paid', paymentVerified: false });
+    const next = await loadTickets();
+    setTickets(next);
+    setDraft(next.find((t) => t.id === ticket.id) ?? ticket);
+  }, []);
 
   const attestPaid = async () => {
     if (!draft) return;
-    await updateTicket(draft.id, {
-      status: 'paid',
-      paymentVerified: false,
-    });
-    const next = await loadTickets();
-    setTickets(next);
-    setDraft(next.find((t) => t.id === draft.id) ?? draft);
+    await attestPaidFor(draft);
     spokenFor.current = null;
     // Paying is not the end: the ticket the authority issued still has to be
     // captured, or there is nothing valid to show at the gate.
     setStep('capture');
   };
+
+  /** Opens the ticket camera, asking for permission the first time. */
+  const openTicketCamera = useCallback(async (): Promise<boolean> => {
+    if (!camPermission?.granted) {
+      const res = await requestCamPermission();
+      if (!res.granted) { toast('Camera blocked', 'error'); return false; }
+    }
+    setScanningTicket(true);
+    return true;
+  }, [camPermission, requestCamPermission, toast]);
+
+  // ── the conversation ───────────────────────────────────────────────────────
+
+  /**
+   * Runs the whole booking as a spoken exchange: ask, listen, act, ask again.
+   *
+   * The loop keeps its own copies of the draft rather than reading state,
+   * because it advances several steps between renders — reading `site` here
+   * would give the value from before the answer that just set it.
+   *
+   * It stops on "cancel", on three answers it cannot understand, when the
+   * camera takes over at capture, and whenever `talking.current` is cleared by
+   * the Stop control.
+   */
+  const converse = useCallback(async (from: Step) => {
+    if (!aiEnabled) { toast('Voice needs the AI backend configured', 'error'); return; }
+    if (talking.current) return;
+
+    talking.current = true;
+    // Claim the opening step, or the narration effect reads the same question
+    // aloud underneath us.
+    spokenFor.current = from;
+    setConversing(true);
+    await unlockAudio();
+
+    let curStep: Step  = from;
+    let curSite        = site;
+    let curDate        = date;
+    let curParty       = party;
+    let curDraft       = draft;
+    let acknowledged   = amountAcknowledged;
+    let override: string | null = null;
+    let options: Monument[] = [];
+    let awaitingAmend  = false;
+    let misses         = 0;
+
+    const goTo = (next: Step) => {
+      curStep = next;
+      spokenFor.current = next;   // the narration effect must not repeat us
+      setStep(next);
+      misses = 0;
+      options = [];
+      awaitingAmend = false;
+    };
+
+    try {
+      while (talking.current && curStep !== 'done') {
+        const line = override ?? promptFor(curStep, {
+          site: curSite, date: curDate, party: curParty,
+          draft: curDraft, acknowledged,
+        });
+        override = null;
+
+        await say(line);
+        if (!talking.current) break;
+
+        const heard = await askByVoice();
+        if (!talking.current) break;
+
+        if (!heard) {
+          misses += 1;
+          if (misses >= 3) {
+            await say('I will stop listening now. Tap the microphone when you are ready.');
+            break;
+          }
+          override = 'I did not hear you. ' + helpFor(curStep);
+          continue;
+        }
+
+        const turn = interpret(curStep, heard, new Date());
+
+        if (turn.kind === 'control') {
+          if (turn.control === 'cancel') {
+            await say('Stopped. Nothing has been booked.');
+            setMode('wallet');
+            break;
+          }
+          if (turn.control === 'help') { override = helpFor(curStep); continue; }
+          if (turn.control === 'repeat') continue;
+          if (turn.control === 'back') {
+            const i = STEP_ORDER.indexOf(curStep);
+            goTo(STEP_ORDER[Math.max(0, i - 1)]);
+            continue;
+          }
+        }
+
+        // "No, change the date" → the next answer says which step to revisit.
+        if (awaitingAmend) {
+          const target = parseAmendTarget(heard);
+          if (target) { goTo(target); continue; }
+          override = 'Say monument, date, or people.';
+          continue;
+        }
+
+        const acceptSite = async (m: Monument) => {
+          if (isFreeEntry(m)) {
+            // Nothing to sell. Say so plainly instead of walking someone
+            // through a payment for a site they can walk into.
+            await say(`${m.name} is free to enter, so there is no ticket to book. It is open from ${m.opens} to ${m.closes}.`);
+            override = 'Which other monument would you like to book?';
+            return;
+          }
+          curSite = m;
+          setSite(m);
+          setSearch('');
+          goTo('when');
+        };
+
+        // A list was read back; "the second one" answers it.
+        if (options.length > 0) {
+          const picked = parseOrdinalChoice(heard, options);
+          if (picked) { options = []; await acceptSite(picked); continue; }
+        }
+
+        switch (turn.kind) {
+          case 'site':
+            await acceptSite(turn.monument);
+            break;
+
+          case 'choose':
+            options = turn.options;
+            override = describeOptions(turn.options);
+            break;
+
+          case 'date': {
+            const when = new Date(`${turn.iso}T00:00:00`);
+            if (turn.iso < isoDate(new Date())) {
+              override = 'That day has already gone. Which day would you like?';
+              break;
+            }
+            if (curSite && isClosedOn(curSite, when)) {
+              override = `${curSite.name} is closed on ${WEEKDAY_NAMES[curSite.closedDay!]}s. Which other day?`;
+              break;
+            }
+            curDate = turn.iso;
+            setDate(turn.iso);
+            goTo('party');
+            break;
+          }
+
+          case 'party':
+            curParty = { ...curParty, ...turn.patch };
+            setParty(curParty);
+            goTo('review');
+            break;
+
+          case 'yes': {
+            if (curStep === 'review') {
+              if (!curSite) { goTo('site'); break; }
+              const ticket = await reserveWith(curSite, curDate, curParty, visitor);
+              if (!ticket) { override = 'I could not reserve that. Shall I try again?'; break; }
+              curDraft = ticket;
+              if (ticket.amount === 0) { goTo('done'); break; }
+              goTo('pay');
+            } else if (curStep === 'pay') {
+              if (!acknowledged) {
+                acknowledged = true;
+                setAcknowledged(true);
+                override = promptFor('pay', {
+                  site: curSite, date: curDate, party: curParty,
+                  draft: curDraft, acknowledged: true,
+                });
+              } else if (curDraft) {
+                await attestPaidFor(curDraft);
+                goTo('capture');
+              }
+            }
+            break;
+          }
+
+          case 'no':
+            if (curStep === 'review') {
+              awaitingAmend = true;
+              override = 'What should I change — the monument, the date, or the number of people?';
+            } else if (curStep === 'pay') {
+              if (!acknowledged) { goTo('review'); }
+              else {
+                override = 'No problem. Say “I have paid” once it is done, or say cancel to stop.';
+              }
+            }
+            break;
+
+          case 'ready':
+            if (await openTicketCamera()) {
+              await say('Camera is open. Hold the ticket steady.');
+              // The scan callback finishes the booking, so the loop ends here
+              // rather than talking over someone lining up a QR code.
+              talking.current = false;
+            } else {
+              override = 'I could not open the camera. Say skip to finish without the ticket.';
+            }
+            break;
+
+          case 'skip':
+            goTo('done');
+            break;
+
+          default:
+            misses += 1;
+            if (misses >= 3) {
+              await say('Let us try this by tapping instead.');
+              talking.current = false;
+              break;
+            }
+            override = `Sorry, I did not understand. ${helpFor(curStep)}`;
+        }
+      }
+
+      if (talking.current && curStep === 'done') {
+        await say('All done. Your booking is saved — show the code at the gate.');
+      }
+    } finally {
+      talking.current = false;
+      setConversing(false);
+    }
+  }, [
+    aiEnabled, toast, site, date, party, draft, amountAcknowledged, visitor,
+    promptFor, say, askByVoice, reserveWith, attestPaidFor, openTicketCamera,
+  ]);
+
+  const stopConversing = useCallback(() => {
+    talking.current = false;
+    setConversing(false);
+    cancel();
+  }, [cancel]);
+
+  // Arriving from "book a ticket to the Taj Mahal" is an explicit invitation
+  // to talk, so the conversation picks up where the command left off. Any
+  // other entry waits to be asked.
+  useEffect(() => {
+    if (!pendingConverse.current) return;
+    const at = pendingConverse.current;
+    pendingConverse.current = null;
+    if (!settings.handsFreeBooking || !aiEnabled) return;
+    void converse(at);
+  }, [step, settings.handsFreeBooking, aiEnabled, converse]);
 
   /**
    * Stores the QR from the issued ticket. The payload is kept verbatim — it is
@@ -326,6 +600,27 @@ export default function TicketsScreen() {
     toast('Booking removed', 'info');
   };
 
+  /**
+   * Fuzzy ranking over the whole catalogue on every keystroke is worth
+   * memoising — it was previously evaluated twice per render.
+   */
+  const results = useMemo(() => findMonuments(search).slice(0, 12), [search]);
+
+  /**
+   * Choosing by tap has to refuse the same things the conversation refuses.
+   * Free sites were bookable here while the spoken path turned them down.
+   */
+  const pickSite = (m: Monument) => {
+    if (isFreeEntry(m)) {
+      toast(`${m.name} is free to enter — no ticket needed`, 'info');
+      void say(`${m.name} is free to enter, so there is no ticket to book. It is open from ${m.opens} to ${m.closes}.`);
+      return;
+    }
+    setSite(m);
+    spokenFor.current = null;
+    setStep('when');
+  };
+
   const stepIndex = STEP_ORDER.indexOf(step);
   const upiLink = draft && upi
     ? upiIntent(upi, draft.amount, `${draft.monumentName} ${draft.date}`, draft.paymentRef)
@@ -339,7 +634,7 @@ export default function TicketsScreen() {
         <Header
           title="Tickets"
           subtitle="Book by voice · show at the gate"
-          right={<IconButton icon="plus" tone="amber" onPress={startBooking} />}
+          right={<IconButton icon="plus" tone="amber" onPress={() => startBooking(false)} />}
         />
 
         <Banner
@@ -352,7 +647,7 @@ export default function TicketsScreen() {
             icon="bookmark"
             title="No bookings yet"
             body="Plan a monument visit by voice — the concierge reads every step aloud and shows a code for the gate."
-            action={<Button label="Book by voice" icon="mic" onPress={startBooking} />}
+            action={<Button label="Book by voice" icon="mic" onPress={() => startBooking()} />}
           />
         ) : (
           <>
@@ -477,6 +772,45 @@ export default function TicketsScreen() {
         />
       </View>
 
+      {/* One control for the whole flow: the conversation moves the steps. */}
+      <View style={s.talkRow}>
+        <Pressable
+          onPress={() => (conversing ? stopConversing() : converse(step))}
+          disabled={!aiEnabled || step === 'done'}
+          style={[
+            s.talkBtn,
+            conversing && s.talkBtnLive,
+            (!aiEnabled || step === 'done') && { opacity: 0.4 },
+          ]}
+        >
+          <Feather
+            name={conversing ? 'square' : 'mic'}
+            size={16}
+            color={conversing ? colors.white : colors.textInverse}
+          />
+          <Text
+            style={[
+              type.label,
+              { color: conversing ? colors.white : colors.textInverse, marginLeft: 8 },
+            ]}
+          >
+            {conversing
+              ? recordState === 'recording' ? 'Listening — say it now' : 'Stop'
+              : 'Talk me through it'}
+          </Text>
+        </Pressable>
+
+        {conversing ? (
+          <Text style={[type.meta, s.talkHint]}>
+            Say “go back”, “repeat”, or “cancel” at any time.
+          </Text>
+        ) : (
+          <Text style={[type.meta, s.talkHint]}>
+            Or use the controls below — both work.
+          </Text>
+        )}
+      </View>
+
       {/* Quiet status line for benign processing */}
       {!!status && (
         <View style={s.statusLine}>
@@ -487,16 +821,6 @@ export default function TicketsScreen() {
 
       {step === 'site' && (
         <>
-          <View style={{ paddingHorizontal: space.xl, marginBottom: space.lg }}>
-            <Button
-              label={recordState === 'recording' ? 'Listening…' : 'Say the monument name'}
-              icon="mic"
-              onPress={pickSiteByVoice}
-              loading={recordState === 'recording'}
-              disabled={!aiEnabled}
-            />
-          </View>
-
           <SectionLabel>Or choose from the list</SectionLabel>
           <View style={{ paddingHorizontal: space.xl, marginBottom: space.md }}>
             <Field
@@ -507,16 +831,24 @@ export default function TicketsScreen() {
             />
           </View>
 
-          {findMonuments(search).slice(0, 8).map((m) => (
+          <Text style={[type.meta, s.resultCount]}>
+            {search.trim()
+              ? results.length === 0
+                ? 'Nothing matched. Try a city, or say it out loud.'
+                : `${results.length} match${results.length === 1 ? '' : 'es'}`
+              : `${MONUMENT_COUNT} sites across India — type or say a name to narrow it`}
+          </Text>
+
+          {results.map((m) => (
             <Pressable
               key={m.id}
-              onPress={() => { setSite(m); spokenFor.current = null; setStep('when'); }}
+              onPress={() => pickSite(m)}
               style={({ pressed }) => [s.siteRow, pressed && { backgroundColor: colors.surfaceHi }]}
             >
               <View style={s.flex}>
                 <Text style={[type.label, { color: colors.text }]}>{m.name}</Text>
                 <Text style={[type.meta, { color: colors.textTertiary, marginTop: 2 }]}>
-                  {m.city}, {m.state} · ₹{m.feeIndian} · {m.authority}
+                  {m.city}, {m.state} · {isFreeEntry(m) ? 'Free entry' : `₹${m.feeIndian}`} · {m.authority}
                 </Text>
               </View>
               <Feather name="chevron-right" size={16} color={colors.textTertiary} />
@@ -571,16 +903,6 @@ export default function TicketsScreen() {
 
       {step === 'party' && !!site && (
         <>
-          <View style={{ paddingHorizontal: space.xl, marginBottom: space.lg }}>
-            <Button
-              label={recordState === 'recording' ? 'Listening…' : 'Say how many adults'}
-              icon="mic"
-              onPress={pickPartyByVoice}
-              loading={recordState === 'recording'}
-              disabled={!aiEnabled}
-            />
-          </View>
-
           <Card>
             <Counter
               label="Adults"
@@ -922,6 +1244,24 @@ function Toggle({
 
 const s = StyleSheet.create({
   flex: { flex: 1 },
+
+  resultCount: {
+    color: colors.textTertiary,
+    paddingHorizontal: space.xl,
+    marginBottom: space.sm,
+  },
+
+  talkRow: { paddingHorizontal: space.xl, marginBottom: space.lg },
+  talkBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    height: 52, borderRadius: radius.lg,
+    backgroundColor: colors.amber,
+    ...shadow(1),
+  },
+  talkBtnLive: { backgroundColor: colors.danger },
+  talkHint: {
+    color: colors.textTertiary, textAlign: 'center', marginTop: space.sm,
+  },
 
   progress: { flexDirection: 'row', gap: 4, paddingHorizontal: space.xl, marginBottom: space.lg },
   progressSeg: {

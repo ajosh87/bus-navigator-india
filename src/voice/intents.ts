@@ -1,5 +1,6 @@
 import { DEMO_ROUTES } from '../languages';
-import { MONUMENTS, findMonuments } from '../monuments';
+import { MONUMENTS } from '../monuments';
+import { bestMonument } from '../monumentSearch';
 
 /**
  * Intent matching for spoken commands.
@@ -126,17 +127,17 @@ export function matchIntent(englishText: string): VoiceIntent {
 
   // ── new booking ──
   if (has(text, 'book', 'buy a ticket', 'reserve', 'visit')) {
-    // "book a ticket to X" — try to name the monument.
-    const byName = MONUMENTS.find((m) =>
-      has(text, m.name.toLowerCase()) || has(text, m.city.toLowerCase()),
-    );
+    // "book a ticket to X" — try to name the monument. City names are
+    // deliberately not matched here: with ten sites in Delhi, "book something
+    // in Delhi" would pick whichever one happens to be listed first.
+    const byName = MONUMENTS.find((m) => has(text, m.name.toLowerCase()));
 
-    // findMonuments returns the whole catalogue for a blank query, so a bare
-    // "book a ticket" would otherwise silently pick the first monument.
+    // bestMonument returns null unless one match is clearly ahead, so a bare
+    // "book a ticket" opens the picker instead of silently choosing a site.
     const remainder = text
       .replace(/\b(book|books|a|an|the|ticket|tickets|to|for|visit|reserve|please)\b/g, '')
       .trim();
-    const named = byName ?? (remainder.length >= 3 ? findMonuments(remainder)[0] : undefined);
+    const named = byName ?? (remainder.length >= 3 ? bestMonument(remainder) : null) ?? undefined;
 
     if (named) {
       return {

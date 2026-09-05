@@ -114,12 +114,21 @@ export async function translate(
 
 // ─── Sarvam Saaras v3 (STT) ──────────────────────────────────────────────────
 
-export async function speechToText(
+export interface Transcription {
+  transcript: string;
+  /** Only set when `languageCode` was AUTO_DETECT_REST. */
+  language?: string;
+  /** 0-1. Only set when the language was detected rather than given. */
+  confidence?: number;
+}
+
+/** Transcribe, and report what language it decided the audio was in. */
+export async function transcribe(
   audioUri: string,    // native: file URI  |  web: blob object URL
   mimeType: string,    // 'audio/wav' on native, 'audio/webm' on web
   languageCode: string,
   personalKey?: string,
-): Promise<string> {
+): Promise<Transcription> {
   const form = new FormData();
 
   if (Platform.OS === 'web') {
@@ -139,8 +148,38 @@ export async function speechToText(
     body: form,
   });
   const json = await parseResponse(res, 'Speech recognition');
-  return (json.transcript ?? '') as string;
+  return {
+    transcript: (json.transcript ?? '') as string,
+    // Populated when `language_code` was AUTO_DETECT_REST. Note the field
+    // names differ from the realtime socket, which returns `language` and
+    // `language_confidence` — the two Sarvam APIs disagree, so neither set of
+    // names can be assumed from the other.
+    language: (json.language_code ?? undefined) as string | undefined,
+    confidence: typeof json.language_probability === 'number'
+      ? json.language_probability
+      : undefined,
+  };
 }
+
+/** Transcript only, for the callers that already know the language. */
+export async function speechToText(
+  audioUri: string,
+  mimeType: string,
+  languageCode: string,
+  personalKey?: string,
+): Promise<string> {
+  const { transcript } = await transcribe(audioUri, mimeType, languageCode, personalKey);
+  return transcript;
+}
+
+/**
+ * Ask the REST recogniser to identify the language itself.
+ *
+ * Deliberately *not* the same token as the realtime socket, which wants
+ * `'auto'`. Sending the wrong one is accepted as a literal language code and
+ * fails in a way that looks like a recognition problem.
+ */
+export const AUTO_DETECT_REST = 'unknown';
 
 // ─── Sarvam Bulbul (TTS) ─────────────────────────────────────────────────────
 

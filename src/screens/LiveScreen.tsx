@@ -9,8 +9,13 @@ import { humanError } from '../errors';
 import { LANGUAGES, LANG_OPTIONS, NATIVE_NAMES } from '../languages';
 import { useApiKey } from '../ApiKeyContext';
 import { useSettings } from '../settingsStore';
-import { translate, speechToText, synthesize, playAudio } from '../api';
-import { RealtimeSession } from '../realtime';
+import {
+  translate, transcribe, synthesize, playAudio, AUTO_DETECT_REST,
+} from '../api';
+import { RealtimeSession, DetectedLanguage } from '../realtime';
+import {
+  attributeSpeaker, canAutoDetect, explainAttribution, normaliseLang,
+} from '../voice/speakerRouting';
 import { unlockAudio, stopPlayback } from '../audio';
 import { useRecorder } from '../useRecorder';
 
@@ -23,9 +28,23 @@ interface Turn {
   source: string;
   translated?: string;
   failed?: boolean;
+  /** Detected language, when the session was running auto-detection. */
+  language?: string;
+  /** Set when the speaker was carried over rather than actually determined. */
+  uncertain?: string;
 }
 
 let seq = 0;
+
+/**
+ * Turns a detected BCP-47 code back into a name a person recognises, so an
+ * unexpected detection can say "that sounded like Tamil" rather than "ta-IN".
+ */
+function languageNameFor(code?: string): string | undefined {
+  const want = normaliseLang(code);
+  if (!want) return undefined;
+  return Object.keys(LANGUAGES).find((name) => LANGUAGES[name] === want);
+}
 
 /**
  * Live mode holds the microphone open across turns, so it needs its own limits.
@@ -72,6 +91,25 @@ export default function LiveScreen() {
   const fromLang = speaker === 'mine' ? mine  : local;
   const toLang   = speaker === 'mine' ? local : mine;
 
+  /**
+   * Auto-attribution only works when the two parties speak different
+   * languages — the detector reports a language, not a voice. With one
+   * language on both sides it can never separate them, so the manual toggle
+   * stays in charge rather than flipping the direction at random.
+   */
+  const autoSpeaker =
+    settings.autoDetectSpeaker
+    && canAutoDetect(LANGUAGES[mine], LANGUAGES[local]);
+
+  /**
+   * The socket's message handler is created once at connect time, but the
+   * language pair can be changed from the picker while the call is running.
+   * Reading these through a ref keeps attribution on the current pair instead
+   * of the one selected when the session opened.
+   */
+  const pairRef = useRef({ mine: LANGUAGES[mine], local: LANGUAGES[local], auto: autoSpeaker });
+  pairRef.current = { mine: LANGUAGES[mine], local: LANGUAGES[local], auto: autoSpeaker };
+
   const key = apiKey || undefined;
   const level = canStream ? wsLevel : micLevel;
 
@@ -103,13 +141,21 @@ export default function LiveScreen() {
 
   /** Translate a settled utterance and speak it. Shared by both paths. */
   const deliver = useCallback(
-    async (text: string, from: Side, alreadyTranslated: boolean) => {
+    async (
+      text: string,
+      from: Side,
+      alreadyTranslated: boolean,
+      meta?: { language?: string; uncertain?: string },
+    ) => {
       const srcName = from === 'mine' ? mine  : local;
       const tgtName = from === 'mine' ? local : mine;
       const id = ++seq;
 
       setPartial('');
-      setTurns((t) => [...t, { id, from, source: text }]);
+      setTurns((t) => [...t, {
+        id, from, source: text,
+        language: meta?.language, uncertain: meta?.uncertain,
+      }]);
 
       try {
         setStage('translating');
@@ -138,19 +184,58 @@ export default function LiveScreen() {
     setConn(true);
     const targetIsEnglish = LANGUAGES[toLang] === 'en-IN';
 
+    /**
+     * With auto-detection the direction is not known until the utterance comes
+     * back, so the socket-side translate shortcut cannot be used — and the
+     * docs do not say whether `mode=translate` even reports the *source*
+     * language it detected. Transcribe, then translate explicitly.
+     */
+    const useTranslateMode = !autoSpeaker && targetIsEnglish;
+
+    // Whether *this socket* was opened with language detection on. Turning the
+    // setting on mid-call cannot retrofit it: a socket opened with a pinned
+    // language never reports a `language` field to attribute from.
+    const sessionDetects = autoSpeaker;
+
     const s = new RealtimeSession({
       relayUrl,
       apiKey,
-      languageCode: LANGUAGES[fromLang],
+      languageCode: autoSpeaker ? 'auto' : LANGUAGES[fromLang],
       // Sarvam's translate mode emits English, so it only saves a round trip
       // when English is where we were heading anyway.
-      mode: targetIsEnglish ? 'translate' : 'transcribe',
+      mode: useTranslateMode ? 'translate' : 'transcribe',
       streamType: 'fast',
       onOpen:    () => { setConn(false); setLive(true); setStage('listening'); },
       onLevel:   setWsLevel,
       onPartial: (t) => { setPartial(t); setStage('listening'); },
-      onFinal:   async (text) => {
-        await deliver(text, speakerRef.current, targetIsEnglish);
+      onFinal:   async (text: string, detected?: DetectedLanguage) => {
+        const pair = pairRef.current;
+        if (!sessionDetects || !pair.auto) {
+          await deliver(text, speakerRef.current, useTranslateMode);
+          if (looping.current) setStage('listening');
+          return;
+        }
+
+        // Who spoke is inferred from the language they spoke in — see
+        // voice/speakerRouting.ts for why that beats acoustic diarization
+        // here, and for what happens when it cannot tell.
+        const verdict = attributeSpeaker({
+          detected: detected?.language,
+          confidence: detected?.confidence,
+          mineCode: pair.mine,
+          localCode: pair.local,
+          lastSide: speakerRef.current,
+        });
+
+        // Keep the on-screen toggle in step, so a later manual correction and
+        // the next uncertain turn both start from the right place.
+        speakerRef.current = verdict.side;
+        setSpeaker(verdict.side);
+
+        await deliver(text, verdict.side, false, {
+          language: verdict.language,
+          uncertain: explainAttribution(verdict, languageNameFor(verdict.language)),
+        });
         if (looping.current) setStage('listening');
       },
       onError:   (e) => { toast(e.message, 'error'); teardown(); },
@@ -170,7 +255,7 @@ export default function LiveScreen() {
       );
       teardown();
     }
-  }, [relayUrl, apiKey, fromLang, toLang, deliver, teardown, toast]);
+  }, [relayUrl, apiKey, fromLang, toLang, autoSpeaker, mine, local, deliver, teardown, toast]);
 
   // ── Path B: proxied REST, one round trip per utterance. Slower than
   //    streaming, but the key stays on the server. ──
@@ -204,18 +289,42 @@ export default function LiveScreen() {
         }
         silentTurns = 0;
 
-        const from = speakerRef.current;
-        const srcName = from === 'mine' ? mine : local;
+        const pair = pairRef.current;
+        const fallbackSide = speakerRef.current;
+        const srcName = fallbackSide === 'mine' ? mine : local;
 
         try {
           setStage('transcribing');
-          const transcript = await speechToText(
-            clip.uri, clip.mimeType, LANGUAGES[srcName], key,
+          // 'unknown' asks the REST recogniser to identify the language, which
+          // is how this path works out who spoke without a tap.
+          const heard = await transcribe(
+            clip.uri,
+            clip.mimeType,
+            pair.auto ? AUTO_DETECT_REST : LANGUAGES[srcName],
+            key,
           );
           if (!looping.current) break;
-          if (!transcript.trim()) continue;
+          if (!heard.transcript.trim()) continue;
 
-          await deliver(transcript, from, false);
+          if (!pair.auto) {
+            await deliver(heard.transcript, fallbackSide, false);
+            continue;
+          }
+
+          const verdict = attributeSpeaker({
+            detected: heard.language,
+            confidence: heard.confidence,
+            mineCode: pair.mine,
+            localCode: pair.local,
+            lastSide: fallbackSide,
+          });
+          speakerRef.current = verdict.side;
+          setSpeaker(verdict.side);
+
+          await deliver(heard.transcript, verdict.side, false, {
+            language: verdict.language,
+            uncertain: explainAttribution(verdict, languageNameFor(verdict.language)),
+          });
         } catch (e: any) {
           toast(humanError(e, 'Could not transcribe'), 'error');
           // Keep listening — one bad turn shouldn't end the conversation.
@@ -248,16 +357,27 @@ export default function LiveScreen() {
     void start();
   }, [params, live, connecting, start]);
 
-  /** Flipping who speaks changes the recognition language, so restart. */
+  /**
+   * Switching sides.
+   *
+   * With a pinned language this changes what the recogniser is listening for,
+   * so the socket has to be rebuilt — a full reconnect on every handover.
+   * Under auto-detection the socket is already listening for anything, so the
+   * tap is only a correction: it sets the speaker for the next uncertain turn
+   * and nothing is torn down.
+   */
   const flipTo = useCallback((side: Side) => {
     if (side === speaker) return;
-    const wasLive = live || connecting;
     setSpeaker(side);
+    speakerRef.current = side;
+    if (autoSpeaker) return;
+
+    const wasLive = live || connecting;
     if (wasLive) {
       teardown();
       setTimeout(() => { void start(); }, 80);
     }
-  }, [speaker, live, connecting, teardown, start]);
+  }, [speaker, autoSpeaker, live, connecting, teardown, start]);
 
   const replay = useCallback(async (turn: Turn) => {
     if (!turn.translated) return;
@@ -352,7 +472,13 @@ export default function LiveScreen() {
 
       <Banner
         tone="info"
-        text={`Tap ${speaker === 'mine' ? 'THEM' : 'YOU'} above when the other person takes a turn.`}
+        text={
+          autoSpeaker
+            ? `Listening for ${mine} and ${local} — I work out who is speaking from the language. Tap above only to correct me.`
+            : settings.autoDetectSpeaker
+              ? `You and they are both set to ${mine}, so I cannot tell your voices apart. Tap ${speaker === 'mine' ? 'THEM' : 'YOU'} when the other person takes a turn.`
+              : `Tap ${speaker === 'mine' ? 'THEM' : 'YOU'} above when the other person takes a turn.`
+        }
       />
 
       {/* Transcript */}
@@ -382,9 +508,32 @@ export default function LiveScreen() {
 
           return (
           <View key={t.id} style={[s.bubble, t.from === 'mine' ? s.bubbleMine : s.bubbleThem]}>
-            <Text style={[type.overline, { color: colors.textTertiary }]}>
-              {t.from === 'mine' ? 'YOU' : 'THEM'}
-            </Text>
+            <View style={s.bubbleHead}>
+              <Text style={[type.overline, { color: colors.textTertiary }]}>
+                {t.from === 'mine' ? 'YOU' : 'THEM'}
+              </Text>
+              {/* Naming the language it heard is what makes a wrong guess
+                  visible — otherwise the turn just looks confidently wrong. */}
+              {!!t.language && (
+                <Text style={[type.overline, { color: colors.textTertiary }]}>
+                  {languageNameFor(t.language) ?? t.language}
+                  {t.uncertain ? ' · UNSURE' : ''}
+                </Text>
+              )}
+            </View>
+
+            {!!t.uncertain && (
+              <Pressable
+                onPress={() => flipTo(t.from === 'mine' ? 'local' : 'mine')}
+                style={s.uncertainRow}
+                hitSlop={6}
+              >
+                <Feather name="help-circle" size={12} color={colors.warning} />
+                <Text style={[type.meta, { color: colors.warning, marginLeft: 6, flex: 1 }]}>
+                  {t.uncertain}
+                </Text>
+              </Pressable>
+            )}
 
             {!sameText && (
               <Text style={[type.body, { color: colors.textSecondary, marginTop: 5 }]}>
@@ -515,6 +664,12 @@ const s = StyleSheet.create({
     borderRadius: radius.lg,
     borderWidth: hairline, borderColor: colors.line,
     padding: space.lg,
+  },
+  bubbleHead: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+  },
+  uncertainRow: {
+    flexDirection: 'row', alignItems: 'center', marginTop: space.sm,
   },
   bubbleMine:    { borderLeftWidth: 2.5, borderLeftColor: colors.teal },
   bubbleThem:    { borderLeftWidth: 2.5, borderLeftColor: colors.amber },

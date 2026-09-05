@@ -269,6 +269,26 @@ export default function SettingsScreen() {
             }
           />
           <SettingRow
+            label="Hands-free booking"
+            hint="Runs the whole booking as a conversation — asks, listens, then moves on. Turn this off if you would rather tap between steps."
+            right={
+              <Switch
+                value={s.handsFreeBooking}
+                onChange={(v) => patchSettings({ handsFreeBooking: v })}
+              />
+            }
+          />
+          <SettingRow
+            label="Detect who is speaking"
+            hint="In Live, works out who is talking from the language they use, so you do not have to tap YOU or THEM. Needs the two of you to have different languages selected."
+            right={
+              <Switch
+                value={s.autoDetectSpeaker}
+                onChange={(v) => patchSettings({ autoDetectSpeaker: v })}
+              />
+            }
+          />
+          <SettingRow
             label="Speak translations"
             hint="Plays the translation as soon as it arrives in Live"
             right={

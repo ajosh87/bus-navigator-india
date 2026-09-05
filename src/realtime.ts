@@ -42,11 +42,22 @@ registerProcessor('pcm-tap', PcmTap);
 
 export type RealtimeMode = 'transcribe' | 'translate';
 
+/** What `language_code=auto` reports back about an utterance. */
+export interface DetectedLanguage {
+  /** e.g. "hi-IN". Absent when the session pinned a language. */
+  language?: string;
+  /** 0-1. Absent on partials, and when the session pinned a language. */
+  confidence?: number;
+}
+
 export interface RealtimeCallbacks {
   /** Interim text — replaces the previous partial. */
   onPartial?: (text: string) => void;
-  /** A settled utterance. */
-  onFinal?: (text: string, languageCode?: string) => void;
+  /**
+   * A settled utterance. `language` and `confidence` are only populated when
+   * the session was opened with `languageCode: 'auto'`.
+   */
+  onFinal?: (text: string, detected?: DetectedLanguage) => void;
   onSpeechStart?: () => void;
   onSpeechEnd?: () => void;
   onLevel?: (level: number) => void;
@@ -197,14 +208,30 @@ export class RealtimeSession {
       msg.data?.text ??
       '';
     const text = typeof candidate === 'string' ? candidate : '';
-    const lang = msg.language_code ?? msg.data?.language_code;
+    // The field is `language`, not `language_code` — verified against
+    // docs.sarvam.ai. Reading the wrong name meant auto-detection could never
+    // have worked even once it was switched on. The older spellings are kept
+    // as fallbacks only because this payload shape is not versioned.
+    const detected: DetectedLanguage = {
+      language:
+        msg.language ??
+        msg.data?.language ??
+        msg.language_code ??
+        msg.data?.language_code,
+      confidence:
+        typeof msg.language_confidence === 'number'
+          ? msg.language_confidence
+          : typeof msg.data?.language_confidence === 'number'
+            ? msg.data.language_confidence
+            : undefined,
+    };
 
     switch (kind) {
       case 'transcript.partial':
         if (text) this.cfg.onPartial?.(text);
         break;
       case 'transcript.final':
-        if (text) this.cfg.onFinal?.(text, lang);
+        if (text) this.cfg.onFinal?.(text, detected);
         break;
       case 'vad.speech_start':
         this.cfg.onSpeechStart?.();
@@ -217,7 +244,7 @@ export class RealtimeSession {
         break;
       default:
         // Unknown event carrying text still counts as a final result.
-        if (text && /final/i.test(kind)) this.cfg.onFinal?.(text, lang);
+        if (text && /final/i.test(kind)) this.cfg.onFinal?.(text, detected);
     }
   }
 

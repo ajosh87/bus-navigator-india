@@ -32,6 +32,16 @@ export interface Settings {
 
   // Behaviour
   narrateSteps: boolean;
+  /**
+   * Whether the booking flow runs itself as a conversation, listening for the
+   * next answer after each question instead of waiting for a tap.
+   */
+  handsFreeBooking: boolean;
+  /**
+   * In Live, detect the spoken language on each turn and infer who is talking
+   * from it, instead of requiring a tap on YOU / THEM.
+   */
+  autoDetectSpeaker: boolean;
   autoSpeakTranslation: boolean;
   showQrCaveats: boolean;
 }
@@ -63,6 +73,8 @@ export const DEFAULTS: Settings = {
   enablePreprocessing: true,
 
   narrateSteps: true,
+  handsFreeBooking: true,
+  autoDetectSpeaker: true,
   autoSpeakTranslation: true,
   showQrCaveats: true,
 };
