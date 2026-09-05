@@ -1,6 +1,6 @@
-import React, { useRef, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import {
-  View, Text, StyleSheet, Pressable, Image, ActivityIndicator, Platform,
+  View, Text, StyleSheet, Pressable, Image, ActivityIndicator, Platform, Linking,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Feather } from '@expo/vector-icons';
@@ -14,6 +14,7 @@ import {
 import { LANGUAGES, LANG_OPTIONS, NATIVE_NAMES } from '../languages';
 import { useApiKey } from '../ApiKeyContext';
 import { digitise, translate, textToSpeech } from '../api';
+import { checkDestination, verdictLabel, DestinationCheck } from '../ticketing/destination';
 
 type Mode   = 'signboard' | 'qr';
 type Source = 'idle' | 'camera' | 'preview';
@@ -51,10 +52,46 @@ export default function ScannerScreen() {
   const [english, setEnglish]     = useState('');
   const [localised, setLocalised] = useState('');
 
+  /** Verdict on a decoded QR destination — the gate before anything opens. */
+  const [scanned, setScanned] = useState<DestinationCheck | null>(null);
+  const announced = useRef<string | null>(null);
+
   const srcLang = langPrefs.local;  // script on the board
   const tgtLang = langPrefs.mine;   // language the traveller reads
 
-  const clearResults = () => { setExtracted(''); setEnglish(''); setLocalised(''); };
+  const clearResults = () => {
+    setExtracted(''); setEnglish(''); setLocalised('');
+    setScanned(null);
+    announced.current = null;
+  };
+
+  /**
+   * Handles a decoded QR.
+   *
+   * The verdict is spoken before anything is opened, because the person most
+   * helped by this app cannot read the domain on screen — and a sticker placed
+   * over a real code is the most common way that gets exploited.
+   */
+  const onQrScanned = useCallback(({ data }: { data: string }) => {
+    if (announced.current === data) return;   // camera fires continuously
+    announced.current = data;
+
+    const verdict = checkDestination(data);
+    setScanned(verdict);
+
+    if (!aiEnabled) return;
+    (async () => {
+      try {
+        const line = verdict.reason;
+        const spoken = LANGUAGES[tgtLang] === 'en-IN'
+          ? line
+          : await translate(line, 'en-IN', LANGUAGES[tgtLang], apiKey || undefined);
+        await textToSpeech(spoken, LANGUAGES[tgtLang], apiKey || undefined);
+      } catch {
+        /* the on-screen verdict still stands if narration fails */
+      }
+    })();
+  }, [aiEnabled, tgtLang, apiKey]);
 
   const reset = () => {
     setSource('idle');
@@ -248,17 +285,36 @@ export default function ScannerScreen() {
 
       {source === 'camera' && (
         <View style={s.stage}>
-          <CameraView ref={cameraRef} style={s.fill} facing="back" />
+          <CameraView
+            ref={cameraRef}
+            style={s.fill}
+            facing="back"
+            // QR mode decodes on-device: instant, offline, and far more reliable
+            // than running OCR over a barcode.
+            barcodeScannerSettings={mode === 'qr' ? { barcodeTypes: ['qr'] } : undefined}
+            onBarcodeScanned={mode === 'qr' ? onQrScanned : undefined}
+          />
           <View style={s.reticle} pointerEvents="none">
             {(['tl', 'tr', 'bl', 'br'] as const).map((c) => (
               <View key={c} style={[s.corner, s[c]]} />
             ))}
           </View>
-          <Pressable style={s.shutterWrap} onPress={shoot}>
-            <View style={s.shutterRing}>
-              <View style={s.shutterCore} />
+
+          {mode === 'signboard' && (
+            <Pressable style={s.shutterWrap} onPress={shoot}>
+              <View style={s.shutterRing}>
+                <View style={s.shutterCore} />
+              </View>
+            </Pressable>
+          )}
+
+          {mode === 'qr' && !scanned && (
+            <View style={s.hintStrip}>
+              <Text style={[type.meta, { color: colors.white }]}>
+                Point at the code — it reads automatically
+              </Text>
             </View>
-          </Pressable>
+          )}
         </View>
       )}
 
@@ -274,6 +330,90 @@ export default function ScannerScreen() {
             </View>
           )}
         </View>
+      )}
+
+      {/* QR destination verdict — shown before anything can be opened */}
+      {!!scanned && (
+        <>
+          <SectionLabel>Where this code goes</SectionLabel>
+          <Card style={scanned.verdict === 'official' ? s.verdictOk : s.verdictWarn}>
+            <View style={s.verdictHead}>
+              <Feather
+                name={
+                  scanned.verdict === 'official' ? 'shield'
+                    : scanned.verdict === 'payment' ? 'credit-card'
+                    : scanned.verdict === 'unknown' ? 'alert-triangle'
+                    : 'x-octagon'
+                }
+                size={15}
+                color={scanned.verdict === 'official' ? colors.success : colors.warning}
+              />
+              <Text
+                style={[
+                  type.overline,
+                  {
+                    color: scanned.verdict === 'official' ? colors.success : colors.warning,
+                    marginLeft: 7,
+                  },
+                ]}
+              >
+                {verdictLabel(scanned.verdict)}
+              </Text>
+            </View>
+
+            {!!scanned.host && (
+              <Text style={[type.h3, { color: colors.text, marginTop: space.md }]}>
+                {scanned.host}
+              </Text>
+            )}
+
+            <Text style={[type.body, { color: colors.textSecondary, marginTop: space.sm }]}>
+              {scanned.reason}
+            </Text>
+
+            {scanned.warnings.length > 0 && (
+              <View style={s.warnList}>
+                {scanned.warnings.map((w) => (
+                  <View key={w} style={s.warnRow}>
+                    <Feather name="alert-circle" size={11} color={colors.textTertiary} />
+                    <Text style={[type.meta, { color: colors.textTertiary, marginLeft: 6, flex: 1 }]}>
+                      {w}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+
+            <View style={{ gap: space.md, marginTop: space.xl }}>
+              {scanned.safeToProceed ? (
+                <Button
+                  label="Open official site"
+                  icon="external-link"
+                  onPress={() => Linking.openURL(scanned.url).catch(() =>
+                    toast('Could not open that link', 'error'),
+                  )}
+                />
+              ) : (
+                // Never a one-tap open for anything unverified. Reading the
+                // address aloud is the safer default.
+                <Button
+                  label="Read the address aloud"
+                  variant="secondary"
+                  icon="volume-2"
+                  disabled={!aiEnabled || !scanned.host}
+                  onPress={() => {
+                    void textToSpeech(
+                      scanned.host.split('').join(' '),
+                      'en-IN',
+                      apiKey || undefined,
+                    ).catch(() => toast('Playback failed', 'error'));
+                  }}
+                />
+              )}
+              <Button label="Scan another" variant="ghost" icon="rotate-ccw" onPress={reset} />
+            </View>
+          </Card>
+        </>
       )}
 
       {/* Results */}
@@ -430,6 +570,19 @@ const s = StyleSheet.create({
     backgroundColor: 'rgba(8,10,14,0.72)',
     alignItems: 'center', justifyContent: 'center',
   },
+
+  hintStrip: {
+    position: 'absolute', bottom: space.lg, alignSelf: 'center',
+    paddingHorizontal: space.lg, paddingVertical: 7,
+    backgroundColor: 'rgba(8,10,14,0.78)',
+    borderRadius: radius.full,
+  },
+
+  verdictOk:   { borderColor: 'rgba(52,211,153,0.35)' },
+  verdictWarn: { borderColor: colors.amberLine, backgroundColor: colors.surface },
+  verdictHead: { flexDirection: 'row', alignItems: 'center' },
+  warnList:    { marginTop: space.md, gap: 5 },
+  warnRow:     { flexDirection: 'row', alignItems: 'center' },
 
   resHead:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   speakBtn: { flexDirection: 'row', alignItems: 'center', paddingVertical: 2 },
