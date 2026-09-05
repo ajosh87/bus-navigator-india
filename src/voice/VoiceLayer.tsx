@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, StyleSheet, Pressable, ActivityIndicator } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -26,6 +26,29 @@ import { matchIntent, VoiceIntent } from './intents';
  */
 
 type Phase = 'idle' | 'listening' | 'thinking' | 'acting';
+
+/** How long a finished result stays on screen before clearing itself. */
+const PANEL_LINGER_MS = 7000;
+
+/**
+ * Turns transport-level failures into something a traveller can act on.
+ * "Failed to fetch" is what fetch() throws when the network is unreachable —
+ * accurate, and meaningless to the person holding the phone.
+ */
+function humanError(e: unknown): string {
+  const raw = e instanceof Error ? e.message : typeof e === 'string' ? e : '';
+
+  if (/failed to fetch|network request failed|load failed|networkerror/i.test(raw)) {
+    return 'No connection to the server. Check your network and try again.';
+  }
+  if (/abort|timeout|timed out/i.test(raw)) {
+    return 'That took too long. Try again.';
+  }
+  if (/not signed in|401/i.test(raw)) {
+    return 'Your session ended. Sign in again.';
+  }
+  return raw ? raw.slice(0, 140) : 'Voice command failed.';
+}
 
 export function VoiceLayer() {
   const { apiKey, aiEnabled, langPrefs } = useApiKey();
@@ -77,10 +100,15 @@ export function VoiceLayer() {
   }, [langCode, key]);
 
   const run = useCallback(async () => {
-    if (busy.current) return;
+    // Cancelling must be checked before the busy guard. `busy.current` is true
+    // for the whole run, so testing it first made this branch unreachable and
+    // left the stop button inert while the mic was open.
+    if (phase === 'listening') {
+      cancel();
+      return;
+    }
 
-    // Second tap while listening cancels rather than stacking a turn.
-    if (phase === 'listening') { cancel(); return; }
+    if (busy.current) return;
 
     busy.current = true;
     setError(null);
@@ -127,13 +155,31 @@ export function VoiceLayer() {
       setPhase('acting');
       execute(intent);
       await speak(intent.speak);
-    } catch (e: any) {
-      setError(e?.message?.slice(0, 120) ?? 'Voice command failed');
+    } catch (e: unknown) {
+      setError(humanError(e));
     } finally {
       busy.current = false;
       setPhase('idle');
     }
   }, [phase, cancel, listen, prewarm, langCode, key, execute, speak]);
+
+  const dismiss = useCallback(() => {
+    setHeard('');
+    setReply('');
+    setError(null);
+  }, []);
+
+  /**
+   * The panel used to persist for the rest of the session once anything was
+   * shown, sitting permanently over the tab bar. It now clears itself, and can
+   * be dismissed by hand.
+   */
+  useEffect(() => {
+    if (phase !== 'idle') return;
+    if (!heard && !reply && !error) return;
+    const timer = setTimeout(dismiss, PANEL_LINGER_MS);
+    return () => clearTimeout(timer);
+  }, [phase, heard, reply, error, dismiss]);
 
   if (!aiEnabled) return null;
 
@@ -154,13 +200,25 @@ export function VoiceLayer() {
                 size={12}
                 color={error ? colors.danger : colors.amber}
               />
-              <Text style={[type.overline, { color: error ? colors.danger : colors.amber, marginLeft: 6 }]}>
-                {error ? 'CAN’T HEAR YOU'
+              <Text
+                style={[
+                  type.overline,
+                  { color: error ? colors.danger : colors.amber, marginLeft: 6, flex: 1 },
+                ]}
+              >
+                {error ? 'DIDN’T WORK'
                   : phase === 'listening' ? 'LISTENING'
                   : phase === 'thinking' ? 'THINKING'
                   : phase === 'acting' ? 'DOING IT'
                   : 'HEARD'}
               </Text>
+
+              {/* Always dismissable — never trap the UI behind a stuck message. */}
+              {!active && (
+                <Pressable onPress={dismiss} hitSlop={10} style={{ padding: 2 }}>
+                  <Feather name="x" size={14} color={colors.textTertiary} />
+                </Pressable>
+              )}
             </View>
 
             {!!heard && (

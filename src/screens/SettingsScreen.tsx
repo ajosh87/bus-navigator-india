@@ -18,6 +18,7 @@ import {
 } from '../settingsStore';
 import { translate, synthesize, playAudio } from '../api';
 import { unlockAudio } from '../audio';
+import { humanError } from '../errors';
 
 export default function SettingsScreen() {
   const { apiKey, setApiKey, proxyKeyConfigured, aiEnabled, relayUrl, upi, langPrefs, setLangPrefs } =
@@ -47,7 +48,7 @@ export default function SettingsScreen() {
       await translate('bus', 'en-IN', 'kn-IN', draft.trim() || key);
       toast('Working — translation came back', 'success');
     } catch (e: any) {
-      toast(e?.message?.slice(0, 160) ?? 'Request failed', 'error');
+      toast(humanError(e, 'Request failed'), 'error');
     } finally {
       setTest(false);
     }
@@ -64,7 +65,7 @@ export default function SettingsScreen() {
       if (!audio) throw new Error('No audio returned');
       await playAudio(audio);
     } catch (e: any) {
-      toast(e?.message?.slice(0, 140) ?? 'Could not play the sample', 'error');
+      toast(humanError(e, 'Could not play the sample'), 'error');
     } finally {
       setPrev(false);
     }

@@ -5,6 +5,7 @@ import { useNavigation } from '@react-navigation/native';
 
 import { colors, type, space, radius, hairline, shadow } from '../theme';
 import { Screen, Header, Button, EmptyState, LanguageSheet, Banner, useToast } from '../ui';
+import { humanError } from '../errors';
 import { LANGUAGES, LANG_OPTIONS, NATIVE_NAMES } from '../languages';
 import { useApiKey } from '../ApiKeyContext';
 import { useSettings } from '../settingsStore';
@@ -25,6 +26,14 @@ interface Turn {
 }
 
 let seq = 0;
+
+/**
+ * Live mode holds the microphone open across turns, so it needs its own limits.
+ * Nobody should discover hours later that the app has been listening because
+ * they walked away without pressing stop.
+ */
+const MAX_SESSION_MS = 10 * 60 * 1000;
+const MAX_SILENT_TURNS = 3;
 
 const STAGE_LABEL: Record<Stage, string> = {
   idle:          '',
@@ -81,6 +90,17 @@ export default function LiveScreen() {
 
   useEffect(() => () => teardown(), [teardown]);
 
+  // The streaming path holds the socket itself, so it needs the same ceiling
+  // the REST loop enforces internally.
+  useEffect(() => {
+    if (!live) return;
+    const cap = setTimeout(() => {
+      toast('Stopped listening after 10 minutes', 'info');
+      teardown();
+    }, MAX_SESSION_MS);
+    return () => clearTimeout(cap);
+  }, [live, teardown, toast]);
+
   /** Translate a settled utterance and speak it. Shared by both paths. */
   const deliver = useCallback(
     async (text: string, from: Side, alreadyTranslated: boolean) => {
@@ -106,7 +126,7 @@ export default function LiveScreen() {
         }
       } catch (e: any) {
         setTurns((t) => t.map((x) => (x.id === id ? { ...x, failed: true } : x)));
-        toast(e?.message?.slice(0, 90) ?? 'Could not translate that', 'error');
+        toast(humanError(e, 'Could not translate that'), 'error');
       }
     },
     [key, mine, local, toast, settings.autoSpeakTranslation],
@@ -158,12 +178,31 @@ export default function LiveScreen() {
     looping.current = true;
     setLive(true);
 
+    const startedAt = Date.now();
+    let silentTurns = 0;
+
     try {
       while (looping.current) {
+        // A live microphone must not be left open indefinitely just because
+        // someone forgot to press stop.
+        if (Date.now() - startedAt > MAX_SESSION_MS) {
+          toast('Stopped listening after 10 minutes', 'info');
+          break;
+        }
+
         setStage('listening');
         const clip = await listen({ silenceMs: 600, noSpeechMs: 15000, maxMs: 15000 });
         if (!looping.current) break;
-        if (!clip) continue;                 // silence or a discarded turn
+
+        if (!clip) {
+          silentTurns += 1;
+          if (silentTurns >= MAX_SILENT_TURNS) {
+            toast('Stopped listening — nothing heard for a while', 'info');
+            break;
+          }
+          continue;
+        }
+        silentTurns = 0;
 
         const from = speakerRef.current;
         const srcName = from === 'mine' ? mine : local;
@@ -178,11 +217,12 @@ export default function LiveScreen() {
 
           await deliver(transcript, from, false);
         } catch (e: any) {
-          toast(e?.message?.slice(0, 90) ?? 'Could not transcribe', 'error');
+          toast(humanError(e, 'Could not transcribe'), 'error');
           // Keep listening — one bad turn shouldn't end the conversation.
         }
       }
     } finally {
+      looping.current = false;
       setLive(false);
       setStage('idle');
       setPartial('');
@@ -322,19 +362,33 @@ export default function LiveScreen() {
           </View>
         )}
 
-        {turns.map((t) => (
+        {turns.map((t) => {
+          // Sarvam's translate mode already returns the target language, so the
+          // transcript and the translation are the same string. Printing both
+          // showed every line twice.
+          const sameText =
+            !!t.translated && t.translated.trim() === t.source.trim();
+
+          return (
           <View key={t.id} style={[s.bubble, t.from === 'mine' ? s.bubbleMine : s.bubbleThem]}>
             <Text style={[type.overline, { color: colors.textTertiary }]}>
               {t.from === 'mine' ? 'YOU' : 'THEM'}
             </Text>
-            <Text style={[type.body, { color: colors.textSecondary, marginTop: 5 }]}>
-              {t.source}
-            </Text>
+
+            {!sameText && (
+              <Text style={[type.body, { color: colors.textSecondary, marginTop: 5 }]}>
+                {t.source}
+              </Text>
+            )}
 
             {t.translated ? (
               <>
-                <View style={s.bubbleRule} />
-                <Text style={[type.h3, { color: colors.text }]}>{t.translated}</Text>
+                {!sameText && <View style={s.bubbleRule} />}
+                <Text
+                  style={[type.h3, { color: colors.text }, sameText && { marginTop: 6 }]}
+                >
+                  {t.translated}
+                </Text>
                 <Pressable onPress={() => replay(t)} style={s.replay} hitSlop={6}>
                   <Feather name="volume-2" size={13} color={colors.teal} />
                   <Text style={[type.meta, { color: colors.teal, marginLeft: 5 }]}>Replay</Text>
@@ -353,7 +407,8 @@ export default function LiveScreen() {
               </View>
             )}
           </View>
-        ))}
+          );
+        })}
 
         {/* Interim text, updating as they speak (streaming only) */}
         {!!partial && (
@@ -397,6 +452,16 @@ export default function LiveScreen() {
               ? `${STAGE_LABEL[stage] || 'Listening'} · ${fromLang} → ${toLang}`
               : `Tap to start · ${fromLang} → ${toLang}`}
         </Text>
+
+        {/* An open microphone should never be ambiguous. */}
+        {live && (
+          <View style={s.micOpenRow}>
+            <View style={s.micOpenDot} />
+            <Text style={[type.meta, { color: colors.danger, marginLeft: 6 }]}>
+              Microphone on — tap the square to stop
+            </Text>
+          </View>
+        )}
 
         {turns.length > 0 && !live && (
           <Pressable onPress={() => setTurns([])} style={{ paddingVertical: space.sm }}>
@@ -466,4 +531,7 @@ const s = StyleSheet.create({
     backgroundColor: colors.danger,
   },
   status: { color: colors.textSecondary, marginTop: space.md, textAlign: 'center' },
+
+  micOpenRow: { flexDirection: 'row', alignItems: 'center', marginTop: space.sm },
+  micOpenDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: colors.danger },
 });

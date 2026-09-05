@@ -16,6 +16,7 @@ import { useApiKey } from '../ApiKeyContext';
 import { digitise, translate, textToSpeech } from '../api';
 import { checkDestination, verdictLabel, DestinationCheck } from '../ticketing/destination';
 import { fetchPage, summarisePage, PageSummary } from '../ticketing/scrape';
+import { humanError } from '../errors';
 
 type Mode   = 'signboard' | 'qr';
 type Source = 'idle' | 'camera' | 'preview';
@@ -95,7 +96,7 @@ export default function ScannerScreen() {
         : await translate(summary.spoken, 'en-IN', LANGUAGES[tgtLang], apiKey || undefined);
       await textToSpeech(spoken, LANGUAGES[tgtLang], apiKey || undefined);
     } catch (e: any) {
-      toast(e?.message?.slice(0, 140) ?? 'Could not read that page', 'error');
+      toast(humanError(e, 'Could not read that page'), 'error');
     } finally {
       setReading(false);
     }
@@ -189,7 +190,7 @@ export default function ScannerScreen() {
       setEnglish(en);
       setLocalised(loc);
     } catch (e: any) {
-      toast(e?.message?.slice(0, 90) ?? 'Scan failed', 'error');
+      toast(humanError(e, 'Scan failed'), 'error');
     } finally {
       setLoading(false);
     }

@@ -15,6 +15,7 @@ import { LANGUAGES, LANG_OPTIONS, NATIVE_NAMES, PHRASE_GROUPS } from '../languag
 import { useApiKey } from '../ApiKeyContext';
 import { translate, speechToText, textToSpeech } from '../api';
 import { useRecorder } from '../useRecorder';
+import { humanError } from '../errors';
 
 export default function PhrasebookScreen() {
   const { apiKey, aiEnabled, langPrefs, setLangPrefs } = useApiKey();
@@ -41,7 +42,7 @@ export default function PhrasebookScreen() {
       const out = await translate(t, LANGUAGES[mine], LANGUAGES[local], apiKey);
       setTranslation(out);
     } catch (e: any) {
-      toast(e?.message?.slice(0, 90) ?? 'Translation failed', 'error');
+      toast(humanError(e, 'Translation failed'), 'error');
     } finally {
       setLoading(false);
     }
@@ -72,7 +73,7 @@ export default function PhrasebookScreen() {
       setPhrase(transcript);
       await doTranslate(transcript);
     } catch (e: any) {
-      toast(e?.message?.slice(0, 90) ?? 'Could not transcribe', 'error');
+      toast(humanError(e, 'Could not transcribe'), 'error');
     } finally {
       setLoading(false);
     }

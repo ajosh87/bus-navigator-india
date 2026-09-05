@@ -26,6 +26,7 @@ import {
 import { translate, speechToText, synthesize, playAudio } from '../api';
 import { useRecorder } from '../useRecorder';
 import { unlockAudio } from '../audio';
+import { humanError } from '../errors';
 
 type Step = 'site' | 'when' | 'party' | 'review' | 'pay' | 'capture' | 'done';
 
@@ -169,7 +170,7 @@ export default function TicketsScreen() {
       if (langCode === 'en-IN') return heard;
       return await translate(heard, langCode, 'en-IN', key);
     } catch (e: any) {
-      toast(e?.message?.slice(0, 90) ?? 'Could not understand', 'error');
+      toast(humanError(e, 'Could not understand'), 'error');
       return null;
     } finally {
       setStatus(null);
