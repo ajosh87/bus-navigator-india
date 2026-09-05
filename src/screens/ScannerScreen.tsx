@@ -15,6 +15,7 @@ import { LANGUAGES, LANG_OPTIONS, NATIVE_NAMES } from '../languages';
 import { useApiKey } from '../ApiKeyContext';
 import { digitise, translate, textToSpeech } from '../api';
 import { checkDestination, verdictLabel, DestinationCheck } from '../ticketing/destination';
+import { fetchPage, summarisePage, PageSummary } from '../ticketing/scrape';
 
 type Mode   = 'signboard' | 'qr';
 type Source = 'idle' | 'camera' | 'preview';
@@ -56,14 +57,49 @@ export default function ScannerScreen() {
   const [scanned, setScanned] = useState<DestinationCheck | null>(null);
   const announced = useRef<string | null>(null);
 
+  const [pageSummary, setPageSummary] = useState<PageSummary | null>(null);
+  const [reading, setReading] = useState(false);
+
   const srcLang = langPrefs.local;  // script on the board
   const tgtLang = langPrefs.mine;   // language the traveller reads
 
   const clearResults = () => {
     setExtracted(''); setEnglish(''); setLocalised('');
     setScanned(null);
+    setPageSummary(null);
     announced.current = null;
   };
+
+  /**
+   * Reads the verified page and narrates only the facts that matter — fees,
+   * hours, closed days. Narrating the whole page would be useless to someone
+   * who cannot read it themselves.
+   */
+  const readPageAloud = useCallback(async () => {
+    if (!scanned?.safeToProceed) return;
+    setReading(true);
+    setPageSummary(null);
+    try {
+      const page = await fetchPage(scanned.url);
+      const summary = summarisePage(page.markdown);
+      setPageSummary(summary);
+
+      if (!summary.spoken) {
+        toast('Could not find prices or timings on that page', 'info');
+        return;
+      }
+      if (!aiEnabled) return;
+
+      const spoken = LANGUAGES[tgtLang] === 'en-IN'
+        ? summary.spoken
+        : await translate(summary.spoken, 'en-IN', LANGUAGES[tgtLang], apiKey || undefined);
+      await textToSpeech(spoken, LANGUAGES[tgtLang], apiKey || undefined);
+    } catch (e: any) {
+      toast(e?.message?.slice(0, 140) ?? 'Could not read that page', 'error');
+    } finally {
+      setReading(false);
+    }
+  }, [scanned, aiEnabled, tgtLang, apiKey, toast]);
 
   /**
    * Handles a decoded QR.
@@ -384,15 +420,39 @@ export default function ScannerScreen() {
               </View>
             )}
 
+            {/* What the page actually says, once read */}
+            {!!pageSummary?.spoken && (
+              <View style={s.pageFacts}>
+                {pageSummary.fees.map((f) => (
+                  <FactRow key={f} icon="credit-card" text={f} />
+                ))}
+                {pageSummary.timings.map((t) => (
+                  <FactRow key={t} icon="clock" text={t} />
+                ))}
+                {pageSummary.closed.map((c) => (
+                  <FactRow key={c} icon="slash" text={c} />
+                ))}
+              </View>
+            )}
+
             <View style={{ gap: space.md, marginTop: space.xl }}>
               {scanned.safeToProceed ? (
-                <Button
-                  label="Open official site"
-                  icon="external-link"
-                  onPress={() => Linking.openURL(scanned.url).catch(() =>
-                    toast('Could not open that link', 'error'),
-                  )}
-                />
+                <>
+                  <Button
+                    label={reading ? 'Reading the page…' : 'Read this page aloud'}
+                    icon="volume-2"
+                    onPress={readPageAloud}
+                    loading={reading}
+                  />
+                  <Button
+                    label="Open official site"
+                    variant="secondary"
+                    icon="external-link"
+                    onPress={() => Linking.openURL(scanned.url).catch(() =>
+                      toast('Could not open that link', 'error'),
+                    )}
+                  />
+                </>
               ) : (
                 // Never a one-tap open for anything unverified. Reading the
                 // address aloud is the safer default.
@@ -499,6 +559,17 @@ export default function ScannerScreen() {
   );
 }
 
+function FactRow({ icon, text }: { icon: any; text: string }) {
+  return (
+    <View style={s.factRow}>
+      <Feather name={icon} size={12} color={colors.textTertiary} style={{ marginTop: 3 }} />
+      <Text style={[type.meta, { color: colors.textSecondary, marginLeft: 8, flex: 1 }]}>
+        {text}
+      </Text>
+    </View>
+  );
+}
+
 const s = StyleSheet.create({
   fill: { flex: 1, backgroundColor: colors.ink },
 
@@ -583,6 +654,12 @@ const s = StyleSheet.create({
   verdictHead: { flexDirection: 'row', alignItems: 'center' },
   warnList:    { marginTop: space.md, gap: 5 },
   warnRow:     { flexDirection: 'row', alignItems: 'center' },
+
+  pageFacts: {
+    marginTop: space.lg, paddingTop: space.lg, gap: space.sm,
+    borderTopWidth: hairline, borderTopColor: colors.lineSoft,
+  },
+  factRow: { flexDirection: 'row', alignItems: 'flex-start' },
 
   resHead:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   speakBtn: { flexDirection: 'row', alignItems: 'center', paddingVertical: 2 },

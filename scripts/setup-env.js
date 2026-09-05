@@ -108,6 +108,10 @@ function assess(pw) {
     '\nSarvam API key (from dashboard.sarvam.ai, blank to skip): ',
   );
 
+  const anakin = await askHidden(
+    'Anakin API key for reading ticketing pages (blank to skip): ',
+  );
+
   const otd = await askHidden(
     'Delhi Open Transit Data key for live buses (blank to skip): ',
   );
@@ -119,6 +123,7 @@ function assess(pw) {
     setEnv('AUTH_SESSION_SECRET', randomBytes(48).toString('base64')),
   ];
   if (sarvam.trim()) results.push(setEnv('SARVAM_API_KEY', sarvam.trim()));
+  if (anakin.trim()) results.push(setEnv('ANAKIN_API_KEY', anakin.trim()));
   if (otd.trim())    results.push(setEnv('OTD_API_KEY', otd.trim()));
 
   console.log('\nEnvironment variables only take effect on the next deploy:\n');
