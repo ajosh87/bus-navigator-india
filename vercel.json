@@ -1,0 +1,9 @@
+{
+  "buildCommand": null,
+  "outputDirectory": "dist",
+  "framework": null,
+  "rewrites": [
+    { "source": "/assets/node_modules/(.*)", "destination": "/assets/vendor/$1" },
+    { "source": "/((?!api/)(?!.*\\.).*)", "destination": "/index.html" }
+  ]
+}

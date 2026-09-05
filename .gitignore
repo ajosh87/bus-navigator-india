@@ -1,0 +1,163 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets — nothing in this block may ever reach a public remote.
+#
+# Every credential this project uses lives in a platform environment variable
+# (Vercel / Cloudflare), never in a tracked file. `.env.example` is the only
+# env file that is committed, and it holds names with empty values.
+# ─────────────────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.env
+.envrc
+
+# Cloudflare Workers local secrets (wrangler reads these for `wrangler dev`)
+.dev.vars
+.dev.vars.*
+
+# Streamlit / Python secret stores
+.streamlit/secrets.toml
+secrets.toml
+secrets.json
+credentials.json
+client_secret*.json
+service-account*.json
+
+# Keys, certificates and keystores
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.asc
+*.gpg
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.ppk
+known_hosts
+
+# Generic credential dumps
+**/secrets/
+**/credentials/
+*.secret
+*token*.json
+auth.json
+.netrc
+.htpasswd
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Platform / deploy state (contains project + org identifiers)
+# ─────────────────────────────────────────────────────────────────────────────
+.vercel
+.wrangler
+.netlify
+.serverless
+.terraform/
+*.tfstate
+*.tfstate.*
+.aws/
+.gcloud/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependencies and build output
+# ─────────────────────────────────────────────────────────────────────────────
+node_modules/
+jspm_packages/
+.pnp
+.pnp.js
+.yarn/cache
+.yarn/install-state.gz
+
+dist/
+build/
+out/
+web-build/
+.expo/
+.expo-shared/
+*.tsbuildinfo
+
+# Generated raster assets (rebuild with `npm run assets`)
+assets/icon.png
+assets/adaptive-icon.png
+assets/splash.png
+assets/favicon.png
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Python (original Streamlit prototype)
+# ─────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Native build artefacts
+# ─────────────────────────────────────────────────────────────────────────────
+/android
+/ios
+*.apk
+*.aab
+*.ipa
+*.keystore.properties
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logs, caches and coverage
+# ─────────────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+logs/
+coverage/
+.nyc_output/
+.cache/
+.parcel-cache/
+.eslintcache
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local databases and dumps
+# ─────────────────────────────────────────────────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+*.sql
+*.dump
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Editors, tooling and OS noise
+# ─────────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Scratch files
+tmp/
+temp/
+scratch/
+*.local

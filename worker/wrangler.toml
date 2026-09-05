@@ -1,0 +1,16 @@
+name = "bus-navigator-relay"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# Secondary check only — Origin is forgeable by non-browser clients, so the
+# relay ticket is what actually authenticates. Leaving this unset now fails
+# closed: the relay rejects everything rather than serving the world.
+[vars]
+ALLOWED_ORIGINS = "https://bus-navigator-india.vercel.app"
+
+# Both of these are secrets, never vars:
+#   npx wrangler secret put SARVAM_API_KEY
+#   npx wrangler secret put AUTH_SESSION_SECRET   # same value as on Vercel
+#
+# AUTH_SESSION_SECRET must match the Vercel deployment exactly, or every relay
+# ticket fails verification and Live streaming stops working.

@@ -1,0 +1,56 @@
+{
+  "expo": {
+    "name": "Bus Navigator",
+    "slug": "pan-india-bus-navigator",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B0E13"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.panindiabus.navigator",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Scan bus signboards and conductor QR codes",
+        "NSMicrophoneUsageDescription": "Record voice phrases to translate for drivers"
+      }
+    },
+    "android": {
+      "package": "com.panindiabus.navigator",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B0E13"
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/favicon.png",
+      "name": "Bus Navigator",
+      "shortName": "Bus Nav",
+      "description": "Pan-India public transit assistant"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Bus Navigator to scan signboards and QR codes."
+        }
+      ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Allow Bus Navigator to record your voice for translation."
+        }
+      ]
+    ]
+  }
+}
