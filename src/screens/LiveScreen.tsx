@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, StyleSheet, Pressable, ScrollView, ActivityIndicator } from 'react-native';
 import { Feather } from '@expo/vector-icons';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 
 import { colors, type, space, radius, hairline, shadow } from '../theme';
 import { Screen, Header, Button, EmptyState, LanguageSheet, Banner, useToast } from '../ui';
@@ -236,6 +236,17 @@ export default function LiveScreen() {
     if (canStream) void startStreaming();
     else void startRestLoop();
   }, [aiEnabled, canStream, startStreaming, startRestLoop]);
+
+  // "start a conversation" used to navigate here and stop, leaving the user
+  // looking at an idle screen after asking for exactly one thing.
+  const params = useRoute().params as { autoStart?: boolean } | undefined;
+  const autoStarted = useRef(false);
+
+  useEffect(() => {
+    if (!params?.autoStart || autoStarted.current || live || connecting) return;
+    autoStarted.current = true;
+    void start();
+  }, [params, live, connecting, start]);
 
   /** Flipping who speaks changes the recognition language, so restart. */
   const flipTo = useCallback((side: Side) => {

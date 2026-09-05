@@ -1,10 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View, Text, StyleSheet, Pressable, ScrollView, ActivityIndicator,
   KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { Feather } from '@expo/vector-icons';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 
 import { colors, type, space, radius, hairline } from '../theme';
 import {
@@ -32,6 +32,20 @@ export default function PhrasebookScreen() {
 
   const mine  = langPrefs.mine;
   const local = langPrefs.local;
+
+  // "how do I say where is the station" arrives here as a param. This screen
+  // read no params at all, so the phrase was silently dropped and the user
+  // landed on an empty phrasebook.
+  const params = useRoute().params as { phrase?: string } | undefined;
+  const handledPhrase = useRef<string | null>(null);
+
+  useEffect(() => {
+    const phraseParam = params?.phrase?.trim();
+    if (!phraseParam || handledPhrase.current === phraseParam) return;
+    handledPhrase.current = phraseParam;
+    setPhrase(phraseParam);
+    void doTranslate(phraseParam);
+  }, [params]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const doTranslate = async (text: string) => {
     const t = text.trim();

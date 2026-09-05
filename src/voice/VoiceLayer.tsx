@@ -56,6 +56,7 @@ export function VoiceLayer() {
   const insets = useSafeAreaInsets();
 
   const [phase, setPhase] = useState<Phase>('idle');
+  const [currentTab, setCurrentTab] = useState<string | null>(null);
   const [heard, setHeard] = useState('');
   const [reply, setReply] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -64,6 +65,17 @@ export function VoiceLayer() {
 
   const key = apiKey || undefined;
   const langCode = LANGUAGES[langPrefs.mine] ?? 'en-IN';
+
+  // Track the focused tab so the button can stand aside where a screen owns
+  // the microphone itself.
+  useEffect(() => {
+    if (!navigationRef.isReady()) return;
+    setCurrentTab(navigationRef.getCurrentRoute()?.name ?? null);
+    const unsub = navigationRef.addListener('state', () => {
+      setCurrentTab(navigationRef.getCurrentRoute()?.name ?? null);
+    });
+    return unsub;
+  }, []);
 
   const execute = useCallback((intent: VoiceIntent) => {
     if (!navigationRef.isReady()) return;
@@ -78,8 +90,11 @@ export function VoiceLayer() {
       case 'map':      go('Routes', { mode: 'map' }); break;
       case 'book':     go('Tickets', { monumentId: intent.monumentId, startBooking: true }); break;
       case 'tickets':  go('Tickets', {}); break;
-      case 'live':     go('Live'); break;
-      case 'scan':     go('Scan'); break;
+      // These three used to navigate and stop there, leaving the user on an
+      // idle screen having asked for something specific. Each now carries the
+      // instruction with it.
+      case 'live':     go('Live', { autoStart: true }); break;
+      case 'scan':     go('Scan', { openCamera: true, mode: 'signboard' }); break;
       case 'translate': go('Speak', { phrase: intent.phrase }); break;
       // 'help' and 'unknown' are answered by voice alone.
       default: break;
@@ -182,6 +197,11 @@ export function VoiceLayer() {
   }, [phase, heard, reply, error, dismiss]);
 
   if (!aiEnabled) return null;
+
+  // Live owns the microphone for the whole conversation and has its own,
+  // larger control. A second floating mic beside it competed for the same
+  // device and left two contradictory buttons on screen.
+  if (currentTab === 'Live') return null;
 
   const active = phase !== 'idle';
   const showPanel = active || !!heard || !!error;

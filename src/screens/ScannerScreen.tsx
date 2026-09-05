@@ -1,10 +1,10 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, StyleSheet, Pressable, Image, ActivityIndicator, Platform, Linking,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Feather } from '@expo/vector-icons';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 
 import { colors, type, space, radius, hairline, shadow } from '../theme';
 import {
@@ -148,6 +148,23 @@ export default function ScannerScreen() {
     setImage(null);
     setSource('camera');
   };
+
+  // "scan this board" used to land here on the idle chooser, having asked for
+  // exactly one thing. Open the camera in the mode that was requested.
+  const params = useRoute().params as
+    | { openCamera?: boolean; mode?: Mode }
+    | undefined;
+  const handledOpen = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!params?.openCamera) return;
+    const token = params.mode ?? 'signboard';
+    if (handledOpen.current === token) return;
+    handledOpen.current = token;
+
+    if (params.mode) setMode(params.mode);
+    void openCamera();
+  }, [params]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const uploadPhoto = async () => {
     const uri = await pickImageWeb();

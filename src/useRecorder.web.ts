@@ -65,14 +65,73 @@ function pickMime(): string {
   return '';
 }
 
+/**
+ * There is one microphone, so there is one stream.
+ *
+ * Every screen that listens calls this hook, and each call used to open its own
+ * getUserMedia stream and AudioContext with its own busy flag. The floating
+ * voice button and a screen's own mic would then record simultaneously and
+ * fight over the device — which is what made voice feel broken everywhere.
+ *
+ * The device is now shared at module scope, and only one caller may be
+ * listening at a time. A new request cancels the previous holder rather than
+ * being refused, because "I pressed the mic and nothing happened" is the worse
+ * failure.
+ */
+const shared: {
+  stream: MediaStream | null;
+  ctx: AudioContext | null;
+  analyser: AnalyserNode | null;
+  /** Cancels whoever currently holds the mic. */
+  releaseActive: (() => void) | null;
+} = { stream: null, ctx: null, analyser: null, releaseActive: null };
+
+/** How many mounted components could still want the mic. */
+let consumers = 0;
+
+function releaseDevice(): void {
+  shared.releaseActive?.();
+  shared.releaseActive = null;
+  shared.stream?.getTracks().forEach((t) => t.stop());
+  shared.ctx?.close().catch(() => {});
+  shared.stream = null;
+  shared.ctx = null;
+  shared.analyser = null;
+}
+
+async function acquireDevice(): Promise<MediaStream | null> {
+  if (shared.stream?.active) return shared.stream;
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
+    const Ctor = window.AudioContext ?? (window as any).webkitAudioContext;
+    const c = new Ctor();
+    const src = c.createMediaStreamSource(s);
+    const an = c.createAnalyser();
+    an.fftSize = 1024;
+    an.smoothingTimeConstant = 0.25;
+    src.connect(an);
+
+    shared.stream = s;
+    shared.ctx = c;
+    shared.analyser = an;
+    return s;
+  } catch {
+    return null;
+  }
+}
+
 export function useRecorder(): RecorderHook {
   const [recordState, setState] = useState<RecordState>('idle');
   const [level, setLevel]       = useState(0);
   const [heardSpeech, setHeard] = useState(false);
 
-  const stream   = useRef<MediaStream | null>(null);
-  const ctx      = useRef<AudioContext | null>(null);
-  const analyser = useRef<AnalyserNode | null>(null);
   const recorder = useRef<MediaRecorder | null>(null);
   const chunks   = useRef<Blob[]>([]);
   const raf      = useRef<number | null>(null);
@@ -82,35 +141,9 @@ export function useRecorder(): RecorderHook {
   // back-to-back in a conversation loop, so track it in a ref instead.
   const busy = useRef(false);
 
-  const getStream = useCallback(async (): Promise<MediaStream | null> => {
-    if (stream.current?.active) return stream.current;
-    try {
-      const s = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-        },
-      });
-      stream.current = s;
+  const getStream = useCallback(() => acquireDevice(), []);
 
-      const Ctor = window.AudioContext ?? (window as any).webkitAudioContext;
-      const c = new Ctor();
-      const src = c.createMediaStreamSource(s);
-      const an = c.createAnalyser();
-      an.fftSize = 1024;
-      an.smoothingTimeConstant = 0.25;
-      src.connect(an);
-      ctx.current = c;
-      analyser.current = an;
-      return s;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  const prewarm = useCallback(async () => !!(await getStream()), [getStream]);
+  const prewarm = useCallback(async () => !!(await acquireDevice()), []);
 
   const teardownLoop = () => {
     if (raf.current !== null) {
@@ -139,6 +172,10 @@ export function useRecorder(): RecorderHook {
         manual = false,
       } = opts;
 
+      // Whoever held the mic loses it — a fresh press must always win, or the
+      // button appears dead while another screen quietly owns the device.
+      shared.releaseActive?.();
+
       if (busy.current) return null;
       busy.current = true;
 
@@ -146,8 +183,8 @@ export function useRecorder(): RecorderHook {
       if (!s) { busy.current = false; return null; }
 
       // A suspended context yields an all-zero analyser, which reads as silence.
-      if (ctx.current?.state === 'suspended') {
-        try { await ctx.current.resume(); } catch {}
+      if (shared.ctx?.state === 'suspended') {
+        try { await shared.ctx.resume(); } catch {}
       }
 
       cancelled.current = false;
@@ -164,6 +201,12 @@ export function useRecorder(): RecorderHook {
       let quietSince: number | null = null;
       let autoStopped = false;
 
+      // Registered so a later caller elsewhere in the app can take the mic.
+      shared.releaseActive = () => {
+        cancelled.current = true;
+        try { if (mr.state !== 'inactive') mr.stop(); } catch {}
+      };
+
       const done = new Promise<AudioResult | null>((resolve) => {
         finish.current = resolve;
         mr.onstop = () => {
@@ -172,6 +215,7 @@ export function useRecorder(): RecorderHook {
           setLevel(0);
           recorder.current = null;
           busy.current = false;
+          if (shared.releaseActive) shared.releaseActive = null;
 
           if (cancelled.current) { resolve(null); return; }
 
@@ -191,7 +235,7 @@ export function useRecorder(): RecorderHook {
       mr.start(100);           // 100ms timeslice keeps chunks flowing
       setState('recording');
 
-      const an = analyser.current!;
+      const an = shared.analyser!;
       const buf = new Float32Array(an.fftSize);
       let lastLevelAt = 0;
 
@@ -257,12 +301,18 @@ export function useRecorder(): RecorderHook {
     return listen();
   }, [listen, stop]);
 
+  // Refcounted: unmounting one screen must not close a microphone another
+  // screen is still using, but the device must not stay open once nobody is.
   useEffect(() => {
+    consumers += 1;
     return () => {
       teardownLoop();
-      recorder.current?.state !== 'inactive' && recorder.current?.stop();
-      stream.current?.getTracks().forEach((t) => t.stop());
-      ctx.current?.close().catch(() => {});
+      if (recorder.current && recorder.current.state !== 'inactive') {
+        cancelled.current = true;
+        try { recorder.current.stop(); } catch {}
+      }
+      consumers -= 1;
+      if (consumers <= 0) releaseDevice();
     };
   }, []);
 
